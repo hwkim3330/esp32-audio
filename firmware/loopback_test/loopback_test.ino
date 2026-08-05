@@ -20,7 +20,10 @@
 #include "board_pins.h"
 
 static const i2s_port_t I2S_PORT = I2S_NUM_0;
-static const int   SR     = 32000;
+// ★ 44100 이어야 한다. begin() 이 PLL 을 256×44.1kHz MCLK 로 잠그는데
+//   ESP32 는 MCLK 을 256×샘플레이트로 낸다. 32kHz 로 두면 8.192MHz 를 주고
+//   코덱은 11.2896MHz 를 기대해 PLL 이 락하지 못한다 → ADC 가 0 만 낸다.
+static const int   SR     = 44100;
 static const int   BLOCK  = 256;
 static const float TONE_HZ[3] = { 500.0f, 1000.0f, 2000.0f };
 
@@ -118,14 +121,16 @@ void setup()
     if (!codec.begin(CN_PIN_I2C_SDA, CN_PIN_I2C_SCL, CN_I2C_FREQ_HZ)) {
         Serial.println("AC101 초기화 실패. 중단."); while (1) delay(1000);
     }
-    codec.SetI2sSampleRate(AC101::SAMPLE_RATE_32000);
+    codec.SetI2sSampleRate(AC101::SAMPLE_RATE_44100);
     codec.SetI2sWordSize(AC101::WORD_SIZE_16_BITS);
     codec.SetI2sMode(AC101::MODE_SLAVE);
     codec.SetI2sFormat(AC101::DATA_FORMAT_I2S);
     codec.SetMode(AC101::MODE_ADC_DAC);          // 전이중
-    // 라이브러리 MODE_ADC 계열이 ADC 경로를 안 열어서 직접 켠다 (mic_node 참조)
-    codec.wr(AC101_ADC_DIG_CTRL, 0x8000);
-    codec.wr(AC101_ADC_APC_CTRL, 0x3bc0);
+    // begin() 이 이미 ADC_SRC=0x2020, ADC_DIG_CTRL=0x8000, ADC_APC_CTRL=0xbbc3 을
+    // 써 둔다. 앞서 이걸 0x3bc0(MODE_LINE 값)으로 덮어써서 ADC 를 직접 껐다 —
+    // 상위 비트가 ADC L/R 인에이블로 보인다. 건드리지 않고 begin() 값을 존중한다.
+    // SetMode(MODE_ADC_DAC) 는 MOD_CLK/RST 만 만지므로 위 값들을 해치지 않는다.
+    codec.wr(AC101_ADC_DIG_CTRL, 0x8000);   // 확인 사살 (begin() 과 같은 값)
     codec.SetVolumeSpeaker(50);
     codec.SetVolumeHeadphone(50);
     Serial.printf("[reg] DIG=0x%04X APC=0x%04X SRC=0x%04X\n",
@@ -162,6 +167,36 @@ void setup()
     Serial.printf("I2S: MCLK%d BCLK%d LRCK%d DOUT%d DIN%d @ %dHz\n\n",
                   CN_PIN_I2S_MCLK, CN_PIN_I2S_BCLK, CN_PIN_I2S_LRCK,
                   CN_PIN_I2S_DOUT, CN_PIN_I2S_DIN, SR);
+
+    // ── 0) ADC 볼륨 순회.
+    //
+    //    begin() 은 ADC_VOL_CTRL(0x41) 을 한 번도 쓰지 않는다. 리셋 기본값이 뮤트면
+    //    ADC 는 도는데 출력이 디지털 무음이 되고, 그게 지금 증상과 정확히 맞는다
+    //    (코덱이 유효한 I2S 프레임을 보내지만 내용이 0).
+    Serial.println("[0] ADC_VOL_CTRL 순회");
+    Serial.printf("  현재값 0x%04X\n", codec.rd(0x41));
+    {
+        static const uint16_t vols[] = { 0xa0a0, 0xc0c0, 0x8080, 0xffff, 0x6060, 0xb0b0 };
+        uint16_t best = 0; float best_d = 0.0f;
+        for (unsigned i = 0; i < sizeof(vols)/sizeof(*vols); i++) {
+            codec.wr(0x41, vols[i]);
+            delay(80);
+            const det_t d0 = run_tone(1000.0f, 0.0f, 350);
+            const det_t d1 = run_tone(1000.0f, 0.6f, 350);
+            const float gain = d1.l - d0.l;
+            Serial.printf("  VOL=0x%04X → 무음 L %6.2f  출력 L %6.2f  차 %6.2f  RMS %5.1f%s\n",
+                          vols[i], d0.l, d1.l, gain, d1.rms_l,
+                          (gain > 2.0f) ? "  <<< 신호!" : "");
+            if (gain > best_d) { best_d = gain; best = vols[i]; }
+        }
+        if (best_d > 2.0f) {
+            codec.wr(0x41, best);
+            Serial.printf("  채택 VOL=0x%04X\n", best);
+        } else {
+            codec.wr(0x41, 0xa0a0);
+            Serial.println("  볼륨으로는 안 깨어난다.");
+        }
+    }
 
     // ── 1) 기준선: 음을 내지 않고 검파. 이 값이 "없음" 의 기준이다.
     Serial.println("[1] 기준선 (무음)");
