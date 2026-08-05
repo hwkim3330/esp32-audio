@@ -1,0 +1,20 @@
+재생용 합성: 40문장 × 4언어 = 160개
+  10/40 문장  507KB  22s
+  20/40 문장  1066KB  44s
+  30/40 문장  1678KB  70s
+  40/40 문장  2238KB  95s
+
+ADPCM: 2237.9KB, 음성 286s, 압축 4.00:1
+  왕복 SNR 16.1~31.2 dB (평균 22.3)
+
+배치: 플래시 160개 (2238KB / 2600KB), PSRAM 0개 (0KB)
+phrasepack.h: 13.67MB 소스 → 플래시 2238KB
+
+인식용 합성: 960개 (40문장 × 보이스 8 × 속도 3)
+  10/40 문장  178s
+  20/40 문장  260s
+  30/40 문장  343s
+  40/40 문장  426s
+
+완료 7.1분
+→ ../data/phrasepack/phrasepack.bin  ../../firmware/cabin_node/phrasepack.h  ../data/phrasepack/ko

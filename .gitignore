@@ -3,3 +3,4 @@ model/data/utterances/
 model/out/_dummy.pt
 __pycache__/
 *.pyc
+model/data/phrasepack/
