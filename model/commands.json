@@ -1,0 +1,71 @@
+{
+  "_comment": "캐빈 노드 명령 사전. phrases 는 같은 의도의 다른 표현들이고, 학습/등록 시 모두 합성된다. reply 는 SD 카드에 미리 렌더할 응답 문장(성격별 여러 테이크). tone 은 ESP32 의 실시간 보이스 컬러링 프리셋.",
+  "version": 1,
+  "intents": [
+    { "id": "ac_on",        "slot": null,   "tone": "calm",   "phrases": ["에어컨 켜줘", "에어컨 켜", "시원하게 해줘", "냉방 켜줘"],
+      "replies": ["에어컨 켰습니다.", "시원하게 해드릴게요.", "네, 냉방 시작합니다."] },
+    { "id": "ac_off",       "slot": null,   "tone": "calm",   "phrases": ["에어컨 꺼줘", "에어컨 꺼", "냉방 꺼줘"],
+      "replies": ["에어컨 껐습니다.", "냉방 중단합니다."] },
+    { "id": "temp_up",      "slot": "step", "tone": "calm",   "phrases": ["온도 올려줘", "온도 올려", "좀 따뜻하게", "히터 올려"],
+      "replies": ["온도를 올렸습니다.", "따뜻하게 조절했어요."] },
+    { "id": "temp_down",    "slot": "step", "tone": "calm",   "phrases": ["온도 내려줘", "온도 내려", "좀 시원하게", "온도 낮춰"],
+      "replies": ["온도를 내렸습니다.", "시원하게 조절했어요."] },
+    { "id": "fan_up",       "slot": null,   "tone": "calm",   "phrases": ["바람 세게", "풍량 올려줘", "바람 강하게"],
+      "replies": ["풍량을 올렸습니다."] },
+
+    { "id": "music_play",   "slot": null,   "tone": "bright", "phrases": ["음악 틀어줘", "노래 틀어줘", "음악 재생", "뭐라도 틀어줘"],
+      "replies": ["음악 재생합니다.", "좋은 거 골라볼게요.", "틀었습니다."] },
+    { "id": "music_stop",   "slot": null,   "tone": "calm",   "phrases": ["음악 꺼줘", "노래 멈춰", "정지", "음악 정지"],
+      "replies": ["음악 멈췄습니다."] },
+    { "id": "music_next",   "slot": null,   "tone": "bright", "phrases": ["다음 곡", "다음 노래", "다음 거 틀어줘", "넘겨"],
+      "replies": ["다음 곡으로 넘깁니다."] },
+    { "id": "music_prev",   "slot": null,   "tone": "bright", "phrases": ["이전 곡", "이전 노래", "앞으로 돌려", "전 곡"],
+      "replies": ["이전 곡으로 돌립니다."] },
+    { "id": "vol_up",       "slot": "step", "tone": "bright", "phrases": ["볼륨 올려줘", "소리 크게", "볼륨 업", "더 크게"],
+      "replies": ["볼륨을 올렸습니다."] },
+    { "id": "vol_down",     "slot": "step", "tone": "calm",   "phrases": ["볼륨 내려줘", "소리 작게", "볼륨 다운", "조용히"],
+      "replies": ["볼륨을 내렸습니다."] },
+
+    { "id": "window_open",  "slot": "zone", "tone": "calm",   "phrases": ["창문 열어줘", "창문 열어", "창 내려줘"],
+      "replies": ["창문 열었습니다."] },
+    { "id": "window_close", "slot": "zone", "tone": "calm",   "phrases": ["창문 닫아줘", "창문 닫아", "창 올려줘"],
+      "replies": ["창문 닫았습니다."] },
+    { "id": "door_lock",    "slot": null,   "tone": "calm",   "phrases": ["문 잠가줘", "문 잠가", "잠금"],
+      "replies": ["문을 잠갔습니다."] },
+
+    { "id": "nav_home",     "slot": null,   "tone": "calm",   "phrases": ["집으로 가자", "집으로 안내해줘", "집 가자"],
+      "replies": ["집으로 안내를 시작합니다."] },
+    { "id": "nav_work",     "slot": null,   "tone": "calm",   "phrases": ["회사로 가자", "회사로 안내해줘", "직장으로 가자"],
+      "replies": ["회사로 안내를 시작합니다."] },
+    { "id": "nav_reroute",  "slot": null,   "tone": "calm",   "phrases": ["경로 재탐색", "다른 길로 가줘", "경로 다시 찾아줘"],
+      "replies": ["경로를 재탐색합니다."] },
+    { "id": "nav_charger",  "slot": null,   "tone": "calm",   "phrases": ["가까운 충전소 찾아줘", "충전소 어디야", "충전소 안내해줘"],
+      "replies": ["가까운 충전소를 찾았습니다."] },
+
+    { "id": "ask_battery",  "slot": null,   "tone": "calm",   "phrases": ["배터리 얼마나 남았어", "배터리 상태 알려줘", "충전 얼마나 됐어"],
+      "replies": ["배터리는 칠십이 퍼센트 남았습니다."] },
+    { "id": "ask_range",    "slot": null,   "tone": "calm",   "phrases": ["얼마나 갈 수 있어", "주행 가능 거리 알려줘", "몇 킬로 갈 수 있어"],
+      "replies": ["약 삼백이십 킬로미터 주행할 수 있습니다."] },
+    { "id": "ask_tire",     "slot": null,   "tone": "calm",   "phrases": ["타이어 공기압 알려줘", "타이어 상태 어때", "공기압 확인해줘"],
+      "replies": ["네 바퀴 모두 정상입니다."] },
+
+    { "id": "autopilot_on", "slot": null,   "tone": "calm",   "phrases": ["자율주행 켜줘", "오토파일럿 켜줘", "자동주행 시작"],
+      "replies": ["자율주행을 시작합니다. 핸들에서 손을 떼지 마세요."] },
+    { "id": "autopilot_off","slot": null,   "tone": "urgent", "phrases": ["자율주행 꺼줘", "오토파일럿 꺼줘", "수동으로 바꿔"],
+      "replies": ["자율주행을 해제했습니다. 직접 운전하세요."] },
+
+    { "id": "greet",        "slot": null,   "tone": "bright", "phrases": ["안녕", "안녕하세요", "잘 있었어", "야"],
+      "replies": ["안녕하세요. 무엇을 도와드릴까요?", "네, 듣고 있습니다.", "안녕하세요. 오늘 컨디션 좋습니다."] },
+    { "id": "thanks",       "slot": null,   "tone": "bright", "phrases": ["고마워", "감사합니다", "잘했어", "고맙다"],
+      "replies": ["별말씀을요.", "언제든지요.", "제가 할 일이죠."] },
+    { "id": "joke",         "slot": null,   "tone": "bright", "phrases": ["농담 하나 해줘", "재밌는 얘기 해줘", "심심해"],
+      "replies": ["제 배터리는 칠십이 퍼센트인데 의욕은 백 퍼센트입니다.", "충전소 가는 길이 제일 설레는 길이죠."] },
+    { "id": "cancel",       "slot": null,   "tone": "calm",   "phrases": ["아니야", "취소", "됐어", "그만"],
+      "replies": ["취소했습니다."] }
+  ],
+  "tones": {
+    "calm":   { "pitch_semitones":  0.0, "formant": 1.00, "tilt_db":  0.0, "gain_db": 0.0 },
+    "bright": { "pitch_semitones":  1.5, "formant": 1.04, "tilt_db":  2.0, "gain_db": 0.0 },
+    "urgent": { "pitch_semitones":  2.5, "formant": 1.06, "tilt_db":  4.0, "gain_db": 3.0 }
+  }
+}

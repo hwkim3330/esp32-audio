@@ -1,0 +1,165 @@
+문장 93개 (학습 66 / 홀드아웃 27)
+보류 보이스 ['F5', 'M5']
+학습 클립 1584, 테스트(학습된 문장) 396, 테스트(처음 보는 문장) 162, OOD 36
+
+인코더: 파라미터 69.4K (int8 약 68KB), 추론 1회 8.14M MAC
+장치: cuda
+
+/home/kim/esp32-audio/model/scripts/train.py:352: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:836.)
+  tl += float(loss) * len(y); tn += len(y)
+ep   1  loss 10.929  train-acc 0.000   2.0s
+ep   2  loss 10.374  train-acc 0.000   1.5s
+ep   3  loss 10.261  train-acc 0.000   1.8s
+ep   4  loss 10.238  train-acc 0.000   1.6s
+ep   5  loss 10.192  train-acc 0.000   1.5s
+ep   6  loss 10.162  train-acc 0.000   1.6s
+ep   7  loss 10.109  train-acc 0.000   1.5s
+ep   8  loss 10.130  train-acc 0.000   1.5s
+ep   9  loss 10.036  train-acc 0.000   1.6s
+ep  10  loss  9.928  train-acc 0.000   1.5s  |  학습된문장 0.182  처음보는문장 0.340  *저장
+ep  11  loss  9.868  train-acc 0.000   1.5s
+ep  12  loss  9.759  train-acc 0.000   1.6s
+ep  13  loss  9.720  train-acc 0.000   1.6s
+ep  14  loss  9.541  train-acc 0.000   1.5s
+ep  15  loss  9.439  train-acc 0.000   1.4s
+ep  16  loss  9.229  train-acc 0.000   1.5s
+ep  17  loss  9.043  train-acc 0.001   1.6s
+ep  18  loss  8.858  train-acc 0.001   1.5s
+ep  19  loss  8.598  train-acc 0.002   1.5s
+ep  20  loss  8.256  train-acc 0.010   1.5s  |  학습된문장 0.583  처음보는문장 0.710  *저장
+ep  21  loss  7.934  train-acc 0.015   1.6s
+ep  22  loss  7.730  train-acc 0.014   1.4s
+ep  23  loss  7.287  train-acc 0.032   1.5s
+ep  24  loss  6.698  train-acc 0.050   1.4s
+ep  25  loss  6.372  train-acc 0.076   1.5s
+ep  26  loss  6.018  train-acc 0.090   1.5s
+ep  27  loss  5.552  train-acc 0.119   1.6s
+ep  28  loss  5.217  train-acc 0.137   1.5s
+ep  29  loss  4.975  train-acc 0.165   1.5s
+ep  30  loss  4.456  train-acc 0.230   1.5s  |  학습된문장 0.848  처음보는문장 0.883  *저장
+ep  31  loss  4.296  train-acc 0.230   1.5s
+ep  32  loss  4.104  train-acc 0.250   1.4s
+ep  33  loss  3.946  train-acc 0.275   1.5s
+ep  34  loss  3.498  train-acc 0.316   1.5s
+ep  35  loss  3.496  train-acc 0.329   1.4s
+ep  36  loss  3.338  train-acc 0.327   1.6s
+ep  37  loss  3.117  train-acc 0.368   1.5s
+ep  38  loss  3.090  train-acc 0.386   1.5s
+ep  39  loss  2.934  train-acc 0.413   1.5s
+ep  40  loss  2.688  train-acc 0.431   1.5s  |  학습된문장 0.886  처음보는문장 0.914  *저장
+ep  41  loss  2.704  train-acc 0.451   1.7s
+ep  42  loss  2.517  train-acc 0.465   1.5s
+ep  43  loss  2.419  train-acc 0.472   1.6s
+ep  44  loss  2.330  train-acc 0.471   1.4s
+ep  45  loss  2.268  train-acc 0.507   1.5s
+ep  46  loss  2.057  train-acc 0.517   1.6s
+ep  47  loss  2.176  train-acc 0.499   1.6s
+ep  48  loss  2.249  train-acc 0.512   1.8s
+ep  49  loss  1.899  train-acc 0.567   1.5s
+ep  50  loss  1.874  train-acc 0.578   1.5s  |  학습된문장 0.917  처음보는문장 0.920  *저장
+ep  51  loss  1.896  train-acc 0.559   1.5s
+ep  52  loss  1.889  train-acc 0.562   1.6s
+ep  53  loss  1.756  train-acc 0.591   1.5s
+ep  54  loss  1.645  train-acc 0.617   1.5s
+ep  55  loss  1.556  train-acc 0.630   1.4s
+ep  56  loss  1.591  train-acc 0.646   1.5s
+ep  57  loss  1.530  train-acc 0.655   1.5s
+ep  58  loss  1.511  train-acc 0.636   1.4s
+ep  59  loss  1.453  train-acc 0.660   1.5s
+ep  60  loss  1.410  train-acc 0.645   1.5s  |  학습된문장 0.929  처음보는문장 0.907
+ep  61  loss  1.302  train-acc 0.689   1.6s
+ep  62  loss  1.191  train-acc 0.690   1.6s
+ep  63  loss  1.183  train-acc 0.706   1.6s
+ep  64  loss  1.184  train-acc 0.678   1.6s
+ep  65  loss  1.051  train-acc 0.717   1.7s
+ep  66  loss  1.197  train-acc 0.705   1.5s
+ep  67  loss  1.028  train-acc 0.732   1.5s
+ep  68  loss  1.042  train-acc 0.722   1.6s
+ep  69  loss  0.940  train-acc 0.754   1.5s
+ep  70  loss  0.874  train-acc 0.758   1.5s  |  학습된문장 0.947  처음보는문장 0.926  *저장
+ep  71  loss  0.946  train-acc 0.755   1.5s
+ep  72  loss  0.801  train-acc 0.781   1.4s
+ep  73  loss  0.795  train-acc 0.788   1.5s
+ep  74  loss  0.792  train-acc 0.798   1.5s
+ep  75  loss  0.742  train-acc 0.798   1.6s
+ep  76  loss  0.668  train-acc 0.814   1.6s
+ep  77  loss  0.735  train-acc 0.775   1.5s
+ep  78  loss  0.667  train-acc 0.814   1.5s
+ep  79  loss  0.645  train-acc 0.829   1.5s
+ep  80  loss  0.604  train-acc 0.837   1.5s  |  학습된문장 0.929  처음보는문장 0.901
+ep  81  loss  0.606  train-acc 0.851   1.6s
+ep  82  loss  0.570  train-acc 0.843   1.5s
+ep  83  loss  0.588  train-acc 0.839   1.4s
+ep  84  loss  0.538  train-acc 0.861   1.4s
+ep  85  loss  0.543  train-acc 0.852   1.5s
+ep  86  loss  0.480  train-acc 0.865   1.5s
+ep  87  loss  0.477  train-acc 0.871   1.5s
+ep  88  loss  0.441  train-acc 0.880   1.5s
+ep  89  loss  0.434  train-acc 0.898   1.7s
+ep  90  loss  0.477  train-acc 0.873   1.6s  |  학습된문장 0.937  처음보는문장 0.920
+ep  91  loss  0.443  train-acc 0.885   1.6s
+ep  92  loss  0.425  train-acc 0.878   1.5s
+ep  93  loss  0.408  train-acc 0.900   1.5s
+ep  94  loss  0.363  train-acc 0.898   1.5s
+ep  95  loss  0.345  train-acc 0.911   1.5s
+ep  96  loss  0.308  train-acc 0.915   1.6s
+ep  97  loss  0.290  train-acc 0.923   1.5s
+ep  98  loss  0.327  train-acc 0.913   1.4s
+ep  99  loss  0.335  train-acc 0.917   1.4s
+ep 100  loss  0.281  train-acc 0.925   1.7s  |  학습된문장 0.937  처음보는문장 0.932  *저장
+ep 101  loss  0.263  train-acc 0.937   1.6s
+ep 102  loss  0.295  train-acc 0.927   1.6s
+ep 103  loss  0.315  train-acc 0.919   1.4s
+ep 104  loss  0.251  train-acc 0.945   1.4s
+ep 105  loss  0.306  train-acc 0.922   1.5s
+ep 106  loss  0.264  train-acc 0.938   1.4s
+ep 107  loss  0.269  train-acc 0.935   1.4s
+ep 108  loss  0.250  train-acc 0.939   1.5s
+ep 109  loss  0.253  train-acc 0.942   1.6s
+ep 110  loss  0.283  train-acc 0.932   1.5s  |  학습된문장 0.939  처음보는문장 0.932
+ep 111  loss  0.247  train-acc 0.942   1.6s
+ep 112  loss  0.278  train-acc 0.934   1.6s
+ep 113  loss  0.241  train-acc 0.946   1.6s
+ep 114  loss  0.248  train-acc 0.947   1.4s
+ep 115  loss  0.246  train-acc 0.947   1.4s
+ep 116  loss  0.249  train-acc 0.942   1.5s
+ep 117  loss  0.243  train-acc 0.939   1.4s
+ep 118  loss  0.218  train-acc 0.951   1.4s
+ep 119  loss  0.227  train-acc 0.943   1.4s
+ep 120  loss  0.242  train-acc 0.944   1.5s  |  학습된문장 0.939  처음보는문장 0.932
+Traceback (most recent call last):
+  File "/home/kim/esp32-audio/model/scripts/train.py", line 443, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/kim/esp32-audio/model/scripts/train.py", line 405, in main
+    t_o, _ = embed_all(model, ds_ood, dev)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/kim/.local/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/kim/esp32-audio/model/scripts/train.py", line 229, in embed_all
+    for x, y in dl:
+  File "/home/kim/.local/lib/python3.12/site-packages/torch/utils/data/dataloader.py", line 741, in __next__
+    data = self._next_data()
+           ^^^^^^^^^^^^^^^^^
+  File "/home/kim/.local/lib/python3.12/site-packages/torch/utils/data/dataloader.py", line 1548, in _next_data
+    return self._process_data(data, worker_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/kim/.local/lib/python3.12/site-packages/torch/utils/data/dataloader.py", line 1586, in _process_data
+    data.reraise()
+  File "/home/kim/.local/lib/python3.12/site-packages/torch/_utils.py", line 775, in reraise
+    raise exception
+KeyError: Caught KeyError in DataLoader worker process 0.
+Original Traceback (most recent call last):
+  File "/home/kim/.local/lib/python3.12/site-packages/torch/utils/data/_utils/worker.py", line 358, in _worker_loop
+    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/kim/.local/lib/python3.12/site-packages/torch/utils/data/_utils/fetch.py", line 54, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+            ~~~~~~~~~~~~^^^^^
+  File "/home/kim/esp32-audio/model/scripts/train.py", line 139, in __getitem__
+    self.text2id[self.items[i]["text"]])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+KeyError: '설명서를 먼저 읽어보세요'
+

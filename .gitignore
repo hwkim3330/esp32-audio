@@ -1,0 +1,5 @@
+# 합성 데이터셋 — 약 180MB, gen_data.py 로 20분이면 재생성된다
+model/data/utterances/
+model/out/_dummy.pt
+__pycache__/
+*.pyc
