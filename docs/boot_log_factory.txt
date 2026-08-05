@@ -1,0 +1,54 @@
+ets Jun  8 2016 00:22:57
+
+rst:0x1 (POWERON_RESET),boot:0x1f (SPI_FAST_FLASH_BOOT)
+configsip: 0, SPIWP:0xee
+clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+mode:DIO, clock div:2
+load:0x3fff0018,len:4
+load:0x3fff001c,len:732
+load:0x40078000,len:7416
+load:0x40080000,len:5340
+entry 0x40080278
+I (448) spiram: SPI RAM mode: flash 40m sram 40m
+I (448) spiram: PSRAM initialized, cache is in low/high (2-core) mode.
+I (449) cpu_start: Pro cpu up.
+I (453) cpu_start: Starting app cpu, entry point is 0x40081390
+I (0) cpu_start: App cpu up.
+I (1353) spiram: SPI SRAM memory test OK
+I (1353) heap_init: Initializing. RAM available for dynamic allocation:
+I (1354) heap_init: At 3FFAFF10 len 000000F0 (0 KiB): DRAM
+I (1360) heap_init: At 3FFCF998 len 00010668 (65 KiB): DRAM
+I (1366) heap_init: At 3FFE0440 len 00003BC0 (14 KiB): D/IRAM
+I (1372) heap_init: At 3FFE4350 len 0001BCB0 (111 KiB): D/IRAM
+I (1379) heap_init: At 400966F4 len 0000990C (38 KiB): IRAM
+I (1385) cpu_start: Pro cpu start user code
+I (1390) spiram: Adding pool of 4096K of external SPI memory to heap allocator
+I (1398) spiram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (78) cpu_start: Starting scheduler on PRO CPU.
+I (0) cpu_start: Starting scheduler on APP CPU.
+esp32_bt_sd_v1.2
+USER_PARTION_2
+I (81) gpio: GPIO[22]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0 
+I (401) phy: phy_version: 3662, 711a97c, May  9 2018, 14:29:06, 0, 0
+I (451) SDCARD_BT_CONTROL_EXAMPLE: [1.0] Initialize peripherals management
+I (451) SDCARD_BT_CONTROL_EXAMPLE: [1.1] Start SD card peripheral
+I (461) SDCARD_BT_CONTROL_EXAMPLE: [1.2] Start SD card peripheral
+E (461) PERIPH_SDCARD: no sdcard detect
+I (471) SDCARD_BT_CONTROL_EXAMPLE: [1.3] Create Bluetootlh peripheral
+un mounted!
+I (1381) SDCARD_BT_CONTROL_EXAMPLE: [1.4] Initialize Touch peripheral
+I (1381) SDCARD_BT_CONTROL_EXAMPLE: [ 2 ] Start codec chip
+I (2501) SDCARD_BT_CONTROL_EXAMPLE: [3.0] Create i2s stream to write data to codec chip
+I (2501) SDCARD_BT_CONTROL_EXAMPLE: [3.1] Get Bluetooth stream
+I (2501) SDCARD_BT_CONTROL_EXAMPLE: [3.2] Create mp3 decoder to decode mp3 file
+I (2511) SDCARD_BT_CONTROL_EXAMPLE: [4.0] Setup event listener
+I (2521) SDCARD_BT_CONTROL_EXAMPLE: [4.1] Listen for all pipeline events
+I (2521) SDCARD_BT_CONTROL_EXAMPLE: [4.2] Listening event from peripherals
+I (2531) SDCARD_BT_CONTROL_EXAMPLE: [4.3] Link it together [Bluetooth]-->bt_stream_reader-->i2s_stream_writer-->[codec_chip]
+W (2551) SDCARD_BT_CONTROL_EXAMPLE: [ 5 ] Tap touch buttons to control music player:
+W (2551) SDCARD_BT_CONTROL_EXAMPLE:       [KEY1][Prev] Previous song.
+W (2561) SDCARD_BT_CONTROL_EXAMPLE:       [KEY2][mode] Select sd or bt mode.
+W (2571) SDCARD_BT_CONTROL_EXAMPLE:       [KEY3][next] Next song.
+W (2571) SDCARD_BT_CONTROL_EXAMPLE:       [KEY4][stop] Stop or Play.
+W (2581) SDCARD_BT_CONTROL_EXAMPLE:       [KEY5][vol+] adjust volume +.
+W (2591) SDCARD_BT_CONTROL_EXAMPLE:       [KEY6][vol-] adjust volume -.
