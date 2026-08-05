@@ -21,7 +21,7 @@ import numpy as np
 import serial
 
 MAGIC = 0xC511
-HDR = 12
+HDR = 18          # magic,seq,label,rssi,n_sc,flags,ms,mac[6]
 LABEL_NAME = {0: "빈 방", 1: "왼쪽", 2: "가운데", 3: "오른쪽", 4: "이동 중",
               0xFF: "라벨없음"}
 
@@ -49,6 +49,7 @@ def main() -> int:
     rssis: list[int] = []
     times: list[int] = []
     seqs: list[int] = []
+    macs: list[bytes] = []
     n_sc_seen: set[int] = set()
     resync = 0
     notes: list[str] = []
@@ -81,6 +82,7 @@ def main() -> int:
                 break
             magic, seq, label, rssi_u, n_sc, flags, ms = struct.unpack_from(
                 "<HHBBBBI", buf, i)
+            mac = bytes(buf[i + 12:i + 18])
             # 매직만으로는 부족하다 — n_sc 가 말이 되는지도 본다
             if magic != MAGIC or not (8 <= n_sc <= 128):
                 i += 1
@@ -97,6 +99,7 @@ def main() -> int:
             rssis.append(rssi_u - 256 if rssi_u > 127 else rssi_u)
             times.append(ms)
             seqs.append(seq)
+            macs.append(mac)
             n_sc_seen.add(n_sc)
             i += need
 
@@ -133,6 +136,7 @@ def main() -> int:
     rs = np.array(rssis, np.int16)[keep]
     ts = np.array(times, np.uint32)[keep]
     sq = np.array(seqs, np.uint16)[keep]
+    mc = np.array([macs[i] for i in np.nonzero(keep)[0]], dtype='S6')
 
     # (프레임, 2*n_sc) → 진폭 (프레임, n_sc)
     iq = X.astype(np.float32).reshape(len(X), -1, 2)
@@ -140,7 +144,7 @@ def main() -> int:
 
     tag = args.tag or time.strftime("%Y%m%d_%H%M%S")
     path = out / f"csi_{tag}.npz"
-    np.savez_compressed(path, amp=amp, iq=X, label=y, rssi=rs, ms=ts, seq=sq)
+    np.savez_compressed(path, amp=amp, iq=X, label=y, rssi=rs, ms=ts, seq=sq, mac=mc)
 
     dur = time.time() - t0
     print(f"\n저장 {path}")
@@ -156,6 +160,13 @@ def main() -> int:
     for k in sorted(set(y.tolist())):
         n = int((y == k).sum())
         print(f"    {LABEL_NAME.get(k, k):8s} {n:6d} 프레임 ({n / len(y) * 100:4.1f}%)")
+    # 송신자 분포 — 사람 라벨이 없을 때 이걸 라벨로 쓴다
+    uniq, cnt = np.unique(mc, return_counts=True)
+    order = np.argsort(-cnt)
+    print(f"  송신자 {len(uniq)}개:")
+    for k in order[:8]:
+        m = ":".join(f"{b:02x}" for b in uniq[k])
+        print(f"    {m}  {int(cnt[k]):6d} 프레임 ({cnt[k]/len(mc)*100:4.1f}%)")
     for n in notes[:4]:
         print(f"  보드: {n}")
     return 0

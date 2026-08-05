@@ -28,6 +28,7 @@
 //   uint8  n_sc       서브캐리어 수
 //   uint8  flags      bit0 = first_word_invalid
 //   uint32 millis
+//   uint8  mac[6]      송신자 MAC — AP 별로 기하가 달라 라벨로 쓸 수 있다
 //   int8   data[2*n_sc]   (imag, real) 쌍
 
 #include <WiFi.h>
@@ -40,6 +41,7 @@ static const int N_KEYS = 6;
 static const int KEY_PIN[N_KEYS] = { 19, 23, 18, 5, 36, 13 };
 static bool key_ok[N_KEYS] = { false };
 static volatile uint8_t cur_label = 0xFF;      // 시작은 라벨 없음
+static volatile bool    button_pressed = false; // 사람이 버튼을 눌렀는가
 static const char *LABEL_NAME[N_KEYS] = {
     "빈 방", "왼쪽", "가운데", "오른쪽", "이동 중", "라벨 없음"
 };
@@ -50,6 +52,8 @@ typedef struct {
     uint8_t  label, n_sc, flags;
     int8_t   rssi;
     uint32_t ms;
+    uint8_t  mac[6];              // 송신자 MAC. AP 마다 위치가 달라 기하가 다르므로
+                                  // 사람 라벨이 없어도 이걸로 파이프라인을 검증할 수 있다.
     int8_t   data[2 * MAX_SC];
     uint16_t bytes;
 } frame_t;
@@ -61,6 +65,19 @@ static frame_t   q[QN];
 static volatile uint8_t q_w = 0, q_r = 0;
 static volatile uint32_t dropped = 0, total = 0;
 static uint16_t seq_ctr = 0;
+static int8_t   cur_chan = 1;
+
+// 자동 라벨 모드: 사람 없이 파이프라인을 검증하기 위한 라벨원.
+//
+// 사람 위치 라벨은 사람이 움직여야 생긴다. 그게 없는 동안 파이프라인(프런트엔드→
+// 인코더→학습→export→온보드 추론)이 맞는지 확인할 방법이 필요하다.
+//
+// 처음엔 송신 AP 를 라벨로 쓰려 했는데 실측에서 한 MAC 이 98.1% 를 차지해 클래스가
+// 안 갈렸다. 채널은 내가 명령할 수 있어 균형을 잡을 수 있고, 주파수 응답이 계통적으로
+// 달라지므로 사람 위치와 같은 구조의 다중클래스 문제가 된다.
+#define AUTO_LABEL_CHANNEL 1
+static const int8_t AL_CH[3] = { 1, 6, 11 };
+#define AL_DWELL_MS 8000
 
 static void IRAM_ATTR csi_cb(void *ctx, wifi_csi_info_t *info)
 {
@@ -82,6 +99,7 @@ static void IRAM_ATTR csi_cb(void *ctx, wifi_csi_info_t *info)
     f->rssi  = info->rx_ctrl.rssi;
     f->ms    = millis();
     f->bytes = (uint16_t)nb;
+    for (int i = 0; i < 6; i++) f->mac[i] = info->mac[i];
     for (int i = 0; i < nb; i++) f->data[i] = info->buf[i];
     q_w = nxt;
 }
@@ -103,7 +121,8 @@ static void keys_poll()
     for (int k = 0; k < N_KEYS; k++) {
         if (!key_ok[k]) continue;
         const bool d = (digitalRead(KEY_PIN[k]) == LOW);
-        if (d && !down[k]) cur_label = (k == 5) ? 0xFF : (uint8_t)k;
+        if (d && !down[k]) { cur_label = (k == 5) ? 0xFF : (uint8_t)k;
+                             button_pressed = true; }
         down[k] = d;
     }
 }
@@ -152,6 +171,7 @@ void setup()
 
     const int8_t chan = pick_busiest_channel();
     esp_wifi_set_channel((uint8_t)chan, WIFI_SECOND_CHAN_NONE);
+    cur_chan = chan;
 
     // 헤더는 텍스트로 한 번만 (수집 스크립트가 이 줄을 찾아 동기를 잡는다)
     Serial.printf("#CSI_LOGGER v1 chan=%d keys_ok=", chan);
@@ -165,10 +185,25 @@ void loop()
 {
     keys_poll();
 
+#if AUTO_LABEL_CHANNEL
+    // 채널을 순환하며 라벨을 채널 인덱스로 둔다. 버튼을 누르면 그쪽이 우선한다
+    // (사람이 실제 라벨을 찍기 시작하면 자동 라벨은 물러나야 한다).
+    static uint32_t ch_t = 0;
+    static uint8_t ch_i = 0;
+    if (!button_pressed && millis() - ch_t > AL_DWELL_MS) {
+        ch_t = millis();
+        ch_i = (uint8_t)((ch_i + 1) % 3);
+        esp_wifi_set_channel((uint8_t)AL_CH[ch_i], WIFI_SECOND_CHAN_NONE);
+        cur_chan = AL_CH[ch_i];
+        cur_label = ch_i;                 // 0,1,2 = ch1,ch6,ch11
+        q_r = q_w;                        // 전환 직후 프레임은 버린다 (라벨 오염 방지)
+    }
+#endif
+
     // 큐를 비운다
     while (q_r != q_w) {
         frame_t *f = &q[q_r];
-        uint8_t hdr[12];
+        uint8_t hdr[18];
         hdr[0] = MAGIC & 0xFF;   hdr[1] = MAGIC >> 8;
         hdr[2] = f->seq & 0xFF;  hdr[3] = f->seq >> 8;
         hdr[4] = f->label;
@@ -177,6 +212,7 @@ void loop()
         hdr[7] = f->flags;
         hdr[8]  = f->ms & 0xFF;        hdr[9]  = (f->ms >> 8) & 0xFF;
         hdr[10] = (f->ms >> 16) & 0xFF; hdr[11] = (f->ms >> 24) & 0xFF;
+        for (int i = 0; i < 6; i++) hdr[12 + i] = f->mac[i];
         Serial.write(hdr, sizeof hdr);
         Serial.write((const uint8_t *)f->data, f->bytes);
         q_r = (uint8_t)((q_r + 1) % QN);
@@ -186,8 +222,8 @@ void loop()
     static uint32_t last = 0;
     if (millis() - last > 2000) {
         last = millis();
-        Serial.printf("#STAT total=%lu dropped=%lu label=%s\n",
-                      (unsigned long)total, (unsigned long)dropped,
+        Serial.printf("#STAT total=%lu dropped=%lu chan=%d label=%s\n",
+                      (unsigned long)total, (unsigned long)dropped, cur_chan,
                       (cur_label == 0xFF) ? "라벨없음" : LABEL_NAME[cur_label]);
     }
 }
