@@ -342,11 +342,24 @@ void setup()
 
     // ── 자기검증. 여기서 걸러야 나중에 "인식률 문제" 로 위장하지 않는다.
     float err = 0.0f;
-    const uint32_t ts = millis();
-    const int rc = cn_selftest(&infer, &err);
-    Serial.printf("자기검증: %s (최대오차 %.2e, 허용 %.1e, %lums)\n",
-                  rc == 0 ? "통과" : "실패", err, CN_SELFTEST_TOL,
-                  (unsigned long)(millis() - ts));
+    int rc = -1;
+    // 3회 반복한다. 1회차는 플래시/PSRAM 캐시 워밍이 섞여서 실제 추론 시간이 아니다.
+    for (int i = 0; i < 3; i++) {
+        const uint32_t ts = millis();
+        rc = cn_selftest(&infer, &err);
+        Serial.printf("자기검증 %d회: %s (오차 %.2e, %lums)\n", i + 1,
+                      rc == 0 ? "통과" : "실패", err,
+                      (unsigned long)(millis() - ts));
+    }
+    // 로그멜도 따로 잰다 — FFT 192회가 어디에 얼마나 쓰이는지 알아야 최적화가 된다.
+    {
+        static int16_t tone[CN_A_SR];
+        for (int i = 0; i < CN_A_SR; i++)
+            tone[i] = (int16_t)(8000.0f * sinf(6.2831853f * 300.0f * i / CN_A_SR));
+        const uint32_t ts = millis();
+        cn_logmel(&infer, tone, CN_A_SR, mel_buf);
+        Serial.printf("로그멜(1초): %lums\n", (unsigned long)(millis() - ts));
+    }
     if (rc != 0) {
         Serial.println("추론 경로가 깨졌다. 중단.");
         while (true) delay(1000);

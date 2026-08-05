@@ -1,0 +1,10 @@
+# 커스텀 파티션 — 앱에 최대한 준다.
+#
+# OTA 도 SPIFFS 도 쓰지 않는다. 이 펌웨어는 부팅해서 듣고 말하는 게 전부고,
+# 갱신은 USB 로 다시 굽는다. 그래서 huge_app(3MB) 이 남기는 1MB 를 앱에 돌린다.
+#
+# 0x10000 + 0x3F0000 = 0x400000 (4MB) — 플래시를 남김없이 쓴다.
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+phy_init, data, phy,      0xe000,   0x1000,
+app0,     app,  factory,  0x10000,  0x3F0000,
