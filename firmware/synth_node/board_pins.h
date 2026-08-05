@@ -27,7 +27,10 @@
 #define CN_PIN_I2S_BCLK     27
 #define CN_PIN_I2S_LRCK     25
 #define CN_PIN_I2S_DOUT     26     // ESP32 → 코덱 (스피커)
-#define CN_PIN_I2S_DIN      35     // 코덱 → ESP32 (마이크)
+// ★ 실측 정정: DIN 은 GPIO34 다. 널리 인용되는 보드 정의는 GPIO35 라고 하지만
+//   이 보드에서 GPIO35 는 정확히 0 을 내고 GPIO34 에서만 신호가 나온다
+//   (DIN 후보 순회 결과: 35→피크 0, 34→피크 63, 나머지→1).
+#define CN_PIN_I2S_DIN      34     // 코덱 → ESP32 (마이크). 실측 확인.
 
 // ── 파워앰프 인에이블 (가정)
 //    공장 펌웨어 부팅 로그에서 GPIO22 를 출력으로 구동하는 것이 관측됐다:
