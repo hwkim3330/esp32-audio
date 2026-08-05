@@ -3,24 +3,32 @@
 보드 하나로 완결된다. PC 없음, 클라우드 없음, SD 없음.
 
 **누르고 말한다 → 온디바이스 인코더가 한국어 문장을 알아맞힌다 → 그 뜻의 다른 언어
-음성이 스피커로 나온다.** 태블릿을 붙이면 문장이 늘고 화면이 생기지만, 안 붙여도
-30문장 × 4언어가 동작한다.
+음성이 스피커로 나온다.** 40문장 × 4언어(en/ja/es/vi) 가 전부 플래시에 있어서
+태블릿이 아예 필요 없다. 붙이면 화면과 문장 추가가 생긴다.
 
 ## 빌드
 
 ```bash
 arduino-cli lib install --git-url https://github.com/Yveaux/AC101   # GPL-3.0 주의
 arduino-cli compile --fqbn \
-  'esp32:esp32:esp32:PSRAM=enabled,FlashSize=4M,PartitionScheme=huge_app,CPUFreq=240' \
+  'esp32:esp32:esp32:PSRAM=enabled,FlashSize=4M,PartitionScheme=custom,CPUFreq=240' \
   firmware/cabin_node
 ```
+
+`PartitionScheme=custom` 이 중요하다. 스케치 폴더의 `partitions.csv` 가 앱에 3.9MB 를
+준다 — OTA 도 SPIFFS 도 안 쓰므로 `huge_app`(3MB) 이 남기는 1MB 를 앱에 돌린다.
+그 1MB 가 "문장 30개" 와 "문장 40개 전부" 를 가른다.
 
 빌드 결과 (실측):
 
 ```
-Sketch uses 3067375 bytes (97%) of program storage space. Maximum is 3145728 bytes.
+Sketch uses 3641447 bytes of program storage space.
 Global variables use 47720 bytes (14%) of dynamic memory.
 ```
+
+앱 파티션 0x3F0000 = 4,128,768 바이트 중 3,641,447 사용 — 88%, 여유 476KB.
+(arduino-cli 가 표시하는 "Maximum is 16777216" 은 커스텀 파티션에서 잘못 나오는
+값이니 무시할 것. 실제 상한은 partitions.csv 의 app0 크기다.)
 
 ## 자원을 어디에 쓰는가
 
@@ -28,7 +36,7 @@ Global variables use 47720 bytes (14%) of dynamic memory.
 
 | 자원 | 있는 것 | 쓰는 것 | 무엇에 |
 | --- | --- | --- | --- |
-| **플래시** | 4MB (앱 파티션 3MB) | **97%** | 인코더 268KB + 프로토타입 46KB + 구문 음성 1678KB + 코드 |
+| **플래시** | 4MB (앱 파티션 3.9MB) | **88%** | 인코더 268KB + 프로토타입 46KB + 구문 음성 2238KB + 코드 |
 | **PSRAM** | 4MB | 약 2.1MB | 스테레오 링 640KB + 추론 964KB + 발화 288KB + 재생 224KB |
 | **내부 DRAM** | 320KB | 14% | 나머지는 전부 PSRAM 으로 밀어냈다 |
 | **코어 0** | 240MHz | 상시 | I2S 캡처 + 링버퍼 + VAD |
@@ -43,8 +51,8 @@ PSRAM 이 왜 필요한지는 링크 에러가 증명했다. 재생·발화 버�
 
 ## 왜 ADPCM 인가
 
-용량이 전부다. 16kHz 16bit 모노는 32KB/s 라 1.7MB 에 53초밖에 안 들어가지만, 4비트
-IMA-ADPCM 은 8KB/s 라 214초가 들어간다. **4배 차이가 "언어 1개" 와 "언어 4개" 를
+용량이 전부다. 16kHz 16bit 모노는 32KB/s 라 2.2MB 에 70초밖에 안 들어가지만, 4비트
+IMA-ADPCM 은 8KB/s 라 280초가 들어간다. **4배 차이가 "언어 1개" 와 "언어 4개" 를
 가른다.** ADPCM 은 곱셈이 없는 정수 코덱이라 디코딩 비용도 사실상 0 이다.
 
 인코더(파이썬)와 디코더(C)가 같은 테이블을 쓰는지 검증했다 — 왕복 SNR 31.6dB 가
@@ -71,7 +79,7 @@ IMA-ADPCM 은 8KB/s 라 214초가 들어간다. **4배 차이가 "언어 1개" �
 | `model_data.h` | 레이어 구조, 멜 필터뱅크(희소 468계수) | 자동 생성 |
 | `model_weights.h` | 인코더 가중치 268KB (플래시 상주) | 자동 생성 |
 | `prototypes.h` | 문장별 프로토타입 93개 | 자동 생성 |
-| `phrasepack.h` | 대상 언어 음성 120개, ADPCM 1678KB | 자동 생성 |
+| `phrasepack.h` | 대상 언어 음성 160개, ADPCM 2238KB | 자동 생성 |
 | `selftest.h` | 부팅 검증 벡터 | 자동 생성 |
 
 `model_*`, `prototypes`, `phrasepack`, `selftest` 는 전부 `model/scripts/` 가 만든다.
@@ -121,8 +129,8 @@ float32 를 골랐다. **그 판단은 틀렸다.** 병목이 연산이 아니�
 ## 아직 안 한 것
 - **실제 마이크 인식률 미검증.** 모델 정확도(문장 0.932)는 전부 합성 음성 기준이다.
 - **태블릿 앱 없음.** WiFi 링크는 TCP 로 열려 있고 JSON 한 줄을 보낸다. 반대편이 없다.
-- **PSRAM 구문 캐시 미구현.** `find_entry()` 가 플래시만 본다. 태블릿에서 받아 PSRAM 에
-  넣는 경로가 자리만 잡혀 있다 (문장 10개 / 560KB 가 여기로 가야 한다).
+- **PSRAM 구문 캐시 미구현.** `find_entry()` 가 플래시만 본다. 지금은 40문장 전부가
+  플래시에 있어서 필요가 없지만, 문장을 더 늘리면 이 경로가 필요하다 (PSRAM 1944KB 여유).
 - **A2DP · ULP · 배터리 모니터 미사용.** 지금 문제를 풀지 않아서 뺐다.
 
 ## 라이선스 주의
