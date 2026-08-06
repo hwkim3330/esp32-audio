@@ -65,6 +65,16 @@ static volatile uint32_t infer_ms = 0, infer_n = 0;
 static const uint8_t WCH[N_WCH] = { 1, 6, 11 };
 static const int WCH_MHZ[N_WCH] = { 2412, 2437, 2462 };
 
+// 실린 모델은 "채널 분류기" 다. 그러면 예측 클래스는 창을 뜬 채널과 같아야 한다.
+// 이 일치율이 파이프라인(PSRAM 링 → 채널 필터 → cf_window → 인코더 → 매칭)이
+// 보드에서 **맞게** 도는지 보는 유일한 자동 지표다. 사람이 필요 없다.
+static volatile uint32_t cls_hit = 0, cls_tot = 0;
+static volatile uint32_t win_span_ms = 0, win_n = 0, win_skip = 0;
+// 창을 뜬 시점의 채널. 출력 시점의 cur_wch_i 와 다를 수 있다(6초마다 바뀐다) —
+// 로그로 혼동행렬을 다시 계산하려면 이 값이 찍혀야 한다.
+static volatile int last_win_ch = -1;
+static volatile uint32_t cls_cm[N_WCH][N_WCH];   // [실제][예측]
+
 // 채널별 기준선과 최근 편차. 채널을 순환하므로 각각 따로 학습해야 한다 —
 // 채널이 다르면 주파수 응답이 계통적으로 달라서 하나의 기준선으로는 못 잡는다.
 static float  base_mu[N_WCH][MAX_SC];
@@ -228,6 +238,26 @@ static void reset_baseline()
 static void print_stats()
 {
     Serial.println("\n=== 검증 통계 ===");
+    // 파이프라인 정확성. 사람 없이 자동으로 나오는 유일한 지표이므로
+    // 마크 표본이 없어 아래에서 조기 반환하더라도 이건 먼저 찍는다.
+    if (cls_tot) {
+        Serial.printf("[모델] 채널 일치 %lu/%lu = %.1f%% (무작위 기대 %.0f%%)\n",
+                      (unsigned long)cls_hit, (unsigned long)cls_tot,
+                      100.0 * cls_hit / cls_tot, 100.0 / N_WCH);
+        Serial.println("  행=창을뜬채널 열=예측  (대각선이 커야 파이프라인이 맞다)");
+        for (int a = 0; a < N_WCH; a++) {
+            uint32_t r = 0;
+            for (int b = 0; b < N_WCH; b++) r += cls_cm[a][b];
+            Serial.printf("   ch%d(%4d):", a, WCH_MHZ[a]);
+            for (int b = 0; b < N_WCH; b++)
+                Serial.printf(" %5lu", (unsigned long)cls_cm[a][b]);
+            Serial.printf("   합%4lu  대각 %5.1f%%\n", (unsigned long)r,
+                          r ? 100.0 * cls_cm[a][a] / r : 0.0);
+        }
+        Serial.printf("  창: %lu프레임 %lums, 프레임 부족으로 건너뜀 %lu회\n",
+                      (unsigned long)win_n, (unsigned long)win_span_ms,
+                      (unsigned long)win_skip);
+    }
     if (!m_n || !u_n) {
         Serial.printf("표본 부족 (마크 %lu, 비마크 %lu). K1 을 눌러 마크하고 지나가세요.\n",
                       (unsigned long)m_n, (unsigned long)u_n);
@@ -435,15 +465,34 @@ void loop()
         // 현재 채널의 프레임 인덱스를 최신순으로 모은다. 인덱스만 담으므로 작다.
         uint16_t idxs[CF_MAX_IN];
         int k = 0;
+        // 아래에서 6초마다 채널이 바뀌므로 지금 값을 박아둔다. 안 그러면
+        // 프레임은 A 채널인데 정답 라벨이 B 가 되는 경우가 생긴다.
+        const uint8_t win_ch = cur_wch_i;
         const uint32_t total = ring_w;
         const uint32_t have = (total < RING_N) ? total : RING_N;
+        // **시간으로 자른다.** 학습 창은 CSI_WIN_SEC(2초)다. 시간 제한 없이
+        // "현재 채널 프레임 128개" 를 긁으면 채널이 6초 머물고 18초 뒤 돌아오므로
+        // 18초 구멍이 여러 개 뚫린 수십 초 구간이 되고, 보간이 그 구멍을 가로질러
+        // 직선으로 메운다. 학습 분포와 완전히 다른 것이 모델에 들어간다.
+        uint32_t t_new = 0;
+        for (uint32_t i2 = 0; i2 < have; i2++) {
+            const uint32_t idx = (total - 1 - i2) % RING_N;
+            if (ring_ch[idx] == win_ch) { t_new = ring_ms[idx]; break; }
+        }
+        const uint32_t t_cut = (t_new > (uint32_t)(CSI_WIN_SEC * 1000.0f))
+                             ? t_new - (uint32_t)(CSI_WIN_SEC * 1000.0f) : 0;
         for (uint32_t i2 = 0; i2 < have && k < CF_MAX_IN; i2++) {
             const uint32_t idx = (total - 1 - i2) % RING_N;
             // 채널이 섞이면 주파수 응답이 섞여 무의미하다 — 현재 채널만.
-            if (ring_ch[idx] != cur_wch_i) continue;
+            if (ring_ch[idx] != win_ch) continue;
+            if (ring_ms[idx] < t_cut) break;   // 링은 시간순이므로 여기서 멈춘다
             idxs[k++] = (uint16_t)idx;
         }
-        if (k >= 8) {
+        win_span_ms = (k >= 2) ? (ring_ms[idxs[0]] - ring_ms[idxs[k - 1]]) : 0;
+        win_n = k;
+        // 학습과 같은 최소 프레임 수를 요구한다(CSI_MIN_PKT). 8은 근거 없는 수였다.
+        if (k < CSI_MIN_PKT) win_skip++;
+        if (k >= CSI_MIN_PKT) {
             // 시간순으로 되집어 PSRAM 버퍼에 연속 배치한다 (보간이 단조를 요구한다).
             for (int a = 0; a < k; a++) {
                 const uint32_t src = idxs[k - 1 - a];
@@ -460,10 +509,25 @@ void loop()
                 const int best = cn_match(emb, cn_protos, CN_N_PROTO, &sc2);
                 last_cls = (best >= 0) ? cn_proto_class[best] : -1;
                 last_score = sc2;
+                // 창을 뜬 채널이 정답이다. 창 안 프레임은 전부 이 채널만이다.
+                last_win_ch = (int)win_ch;
+                if (last_cls >= 0 && last_cls < N_WCH && win_ch < N_WCH) {
+                    cls_cm[win_ch][last_cls]++;
+                    cls_tot++;
+                    if (last_cls == (int)win_ch) cls_hit++;
+                }
                 infer_ms = millis() - t0;
                 infer_n++;
             }
         }
+    }
+
+    // 60초마다 자동으로 혼동행렬을 뱉는다. 버튼을 누를 사람이 없어도
+    // 파이프라인 정확성의 정본 숫자가 로그에 남는다.
+    static uint32_t last_auto = 0;
+    if (cls_tot >= 20 && millis() - last_auto > 60000) {
+        last_auto = millis();
+        print_stats();
     }
 
     // 마크/비마크로 나눠 누적한다. 기준선이 다 준비된 뒤부터만 센다.
@@ -488,9 +552,13 @@ void loop()
     }
 
     if (infer_ready)
-        Serial.printf("        [모델] 클래스%d 코사인%.2f %lums (%lu회)\n",
-                      last_cls, last_score, (unsigned long)infer_ms,
-                      (unsigned long)infer_n);
+        Serial.printf("        [모델] ch%d→클래스%d 코사인%.2f %lums (%lu회, 일치 %lu/%lu %.0f%%) 창%lu프레임/%lums 건너뜀%lu\n",
+                      last_win_ch, last_cls, last_score, (unsigned long)infer_ms,
+                      (unsigned long)infer_n, (unsigned long)cls_hit,
+                      (unsigned long)cls_tot,
+                      cls_tot ? 100.0 * cls_hit / cls_tot : 0.0,
+                      (unsigned long)win_n, (unsigned long)win_span_ms,
+                      (unsigned long)win_skip);
     Serial.printf("%s  | BLE %d/%d (유효%d, %lu광고) 점수%.1f  | 대역 %.1f%s  sc%d 준비%d/%d\n",
                   marked ? "  [마크]" : "        ",
                   ble_hot, ble_valid, ble_valid, (unsigned long)ble_pkt,
