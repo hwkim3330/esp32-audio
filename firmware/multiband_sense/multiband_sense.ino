@@ -28,6 +28,37 @@
 #include <esp_gap_ble_api.h>
 #include <math.h>
 
+#include "cn_infer.h"      // 학습된 인코더 추론 (음성과 같은 엔진, 조건 컴파일로 로그멜 제외)
+#include "csi_front.h"     // CSI 창 프런트엔드 — 파이썬과 1.371e-06 로 대조됨
+#include "prototypes.h"
+#include "selftest.h"
+
+// ── LED. 어느 GPIO 가 LED 인지 실기로 특정하지 못했다(관찰자가 없었다).
+// 그래서 안전한 후보를 전부 같은 상태 신호로 구동한다 — 하나가 LED 면 그게 표시등이 된다.
+// 화면이 없는 보드에서 유일한 시각 피드백이다.
+//
+// 후보에서 뺀 것: 버튼(19/23/18/5/36/13), I2C(32/33), I2S(0/25/26/27/34/35),
+// PSRAM(16/17 — 실측 확인), 플래시(6~11), 스트래핑(12/15).
+#define N_LED 4
+static const int LED_PIN[N_LED] = { 22, 21, 2, 4 };
+
+// ── PSRAM: CSI 원시 프레임 링. 창을 시간으로 잘라 모델에 넣으려면 이력이 필요하다.
+#define RING_N 512
+static int8_t   *ring_iq;      // RING_N x (2*n_sc)
+static uint32_t *ring_ms;
+static volatile uint32_t ring_w = 0;
+static volatile uint8_t  ring_ch[RING_N];
+
+static cn_ctx_t infer_ctx;
+static float   *infer_win;     // CN_N_FRAMES x CN_N_MELS
+static int8_t  *infer_packed;  // CF_MAX_IN x (2*n_sc)  — PSRAM
+static uint32_t *infer_wms;    // CF_MAX_IN
+static float   *infer_scr;     // CF_MAX_IN x n_sc      — cf_window 스크래치
+static bool     infer_ready = false;
+static volatile int   last_cls = -1;
+static volatile float last_score = 0.0f;
+static volatile uint32_t infer_ms = 0, infer_n = 0;
+
 // ── WiFi CSI
 #define MAX_SC     128
 #define N_WCH      3
@@ -61,6 +92,28 @@ static volatile int ble_valid = 0, ble_hot = 0;
 // (실측: 60프레임에 50초 동안 3채널 중 1개만 준비됐다).
 #define WARMUP_N 40
 
+// ── 버튼 6개. 화면이 없으니 버튼이 유일한 입력이고, 가장 중요한 용도는 **정답 찍기**다.
+//
+// 이 펌웨어의 유일한 미검증 항목이 "실제 움직임에 반응하는가" 였다. 사람이 지나가면서
+// 마크를 누르면 보드가 마크 구간과 비마크 구간의 점수 분포를 스스로 비교한다 —
+// PC 도 관찰자도 필요 없다.
+//
+//   K1 짧게 = 마크 토글(사람 있음)   K1 길게 = 기준선 재학습
+//   K2 = 임계값 −0.5                K3 = 임계값 +0.5
+//   K4 = 채널 고정/순환 토글         K5 짧게 = BLE 표 리셋, 길게 = 통계 요약
+//   K6 = 통계 요약
+#define N_KEYS 6
+static const int KEY_PIN[N_KEYS] = { 19, 23, 18, 5, 36, 13 };
+static bool key_ok[N_KEYS] = { false };
+static volatile bool  marked = false;
+static volatile float thresh = 3.0f;
+static volatile bool  ch_lock = false;
+
+// 마크/비마크 구간의 점수 통계. 이게 검증의 전부다.
+static double m_sum = 0, m_sq = 0, u_sum = 0, u_sq = 0;
+static uint32_t m_n = 0, u_n = 0;
+static uint32_t m_hit = 0, u_hit = 0;      // 임계값 초과 횟수
+
 // ───────────────────────────────────────── WiFi CSI
 static void IRAM_ATTR csi_cb(void *ctx, wifi_csi_info_t *info)
 {
@@ -72,6 +125,17 @@ static void IRAM_ATTR csi_cb(void *ctx, wifi_csi_info_t *info)
     const int n = (sc > MAX_SC) ? MAX_SC : sc;
     if (!n_sc) n_sc = (uint8_t)n;
     const int start = info->first_word_invalid ? 2 : 0;
+
+    // PSRAM 링에 원시 IQ 를 적재한다 — 모델 입력용 창을 나중에 만든다.
+    if (ring_iq) {
+        const uint32_t w = ring_w % RING_N;
+        int8_t *dst = ring_iq + (size_t)w * 2 * MAX_SC;
+        const int nb = (info->len > 2 * MAX_SC) ? 2 * MAX_SC : info->len;
+        for (int i = 0; i < nb; i++) dst[i] = info->buf[i];
+        ring_ms[w] = info->rx_ctrl.timestamp / 1000;   // us → ms
+        ring_ch[w] = ci;
+        ring_w++;
+    }
 
     float amp[MAX_SC];
     for (int i = 0; i < n; i++) {
@@ -152,6 +216,88 @@ static void ble_cb(esp_gap_ble_cb_event_t ev, esp_ble_gap_cb_param_t *p)
     ble_valid = valid; ble_hot = hot;
 }
 
+static void reset_baseline()
+{
+    for (int i = 0; i < N_WCH; i++) {
+        base_ok[i] = false; acc_n[i] = 0;
+        for (int j = 0; j < MAX_SC; j++) { acc_sum[i][j] = 0; acc_sq[i][j] = 0; }
+    }
+    Serial.println("[key] 기준선 재학습 시작 — 움직이지 마세요");
+}
+
+static void print_stats()
+{
+    Serial.println("\n=== 검증 통계 ===");
+    if (!m_n || !u_n) {
+        Serial.printf("표본 부족 (마크 %lu, 비마크 %lu). K1 을 눌러 마크하고 지나가세요.\n",
+                      (unsigned long)m_n, (unsigned long)u_n);
+        return;
+    }
+    const double mm = m_sum / m_n, um = u_sum / u_n;
+    const double ms = sqrt(fmax(m_sq / m_n - mm * mm, 0.0));
+    const double us = sqrt(fmax(u_sq / u_n - um * um, 0.0));
+    // 분리도(Cohen's d): 두 분포가 얼마나 떨어졌나. 1.0 이상이면 쓸만하다.
+    const double pooled = sqrt(((ms * ms) + (us * us)) / 2.0);
+    const double d = pooled > 1e-9 ? (mm - um) / pooled : 0.0;
+    Serial.printf("사람 있음 (마크)  %6lu 표본  점수 %.2f ± %.2f   임계초과 %.0f%%\n",
+                  (unsigned long)m_n, mm, ms, 100.0 * m_hit / m_n);
+    Serial.printf("사람 없음        %6lu 표본  점수 %.2f ± %.2f   임계초과 %.0f%%\n",
+                  (unsigned long)u_n, um, us, 100.0 * u_hit / u_n);
+    Serial.printf("분리도 d = %.2f  (%s)\n", d,
+                  d > 1.5 ? "좋다" : (d > 0.8 ? "쓸만하다" : "부족 — 임계값이나 특징을 손봐야 한다"));
+    Serial.printf("현재 임계값 %.1f — 감지율 %.0f%%, 오탐율 %.0f%%\n\n",
+                  thresh, 100.0 * m_hit / m_n, 100.0 * u_hit / u_n);
+}
+
+static void keys_poll()
+{
+    static uint32_t last = 0;
+    static bool down[N_KEYS] = { false };
+    static uint32_t t_down[N_KEYS] = { 0 };
+    static bool longed[N_KEYS] = { false };
+    if (millis() - last < 40) return;
+    last = millis();
+
+    for (int k = 0; k < N_KEYS; k++) {
+        if (!key_ok[k]) continue;
+        const bool d = (digitalRead(KEY_PIN[k]) == LOW);
+        if (d && !down[k]) { down[k] = true; t_down[k] = millis(); longed[k] = false; }
+        else if (d && down[k] && !longed[k] && millis() - t_down[k] > 700) {
+            longed[k] = true;
+            if (k == 0) reset_baseline();
+            else if (k == 4) print_stats();
+        } else if (!d && down[k]) {
+            down[k] = false;
+            if (longed[k]) continue;
+            switch (k) {
+            case 0:
+                marked = !marked;
+                Serial.printf("[key] 마크 %s\n", marked ? "ON — 사람 있음" : "OFF");
+                break;
+            case 1:
+                if (thresh > 1.0f) thresh -= 0.5f;
+                Serial.printf("[key] 임계값 %.1f\n", thresh);
+                break;
+            case 2:
+                thresh += 0.5f;
+                Serial.printf("[key] 임계값 %.1f\n", thresh);
+                break;
+            case 3:
+                ch_lock = !ch_lock;
+                Serial.printf("[key] 채널 %s\n", ch_lock ? "고정" : "순환");
+                break;
+            case 4:
+                n_ble = 0; ble_pkt = 0; ble_hot = 0; ble_valid = 0;
+                Serial.println("[key] BLE 표 리셋");
+                break;
+            case 5:
+                print_stats();
+                break;
+            }
+        }
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -199,8 +345,63 @@ void setup()
         Serial.println("[ble] bluedroid 실패 — WiFi CSI 만으로 계속한다");
     }
 
-    Serial.printf("\n기준선 학습 중 (채널당 %d 프레임). 주변에서 움직이지 마세요.\n\n",
+    // ── 버튼. 부팅 시 LOW 로 읽히면 배선이 의심스러워 비활성한다(K6=GPIO13 실측).
+    for (int k = 0; k < N_KEYS; k++)
+        pinMode(KEY_PIN[k], (KEY_PIN[k] == 36 || KEY_PIN[k] == 5) ? INPUT : INPUT_PULLUP);
+    Serial.print("[keys] ");
+    int n_ok = 0;
+    for (int k = 0; k < N_KEYS; k++) {
+        key_ok[k] = (digitalRead(KEY_PIN[k]) == HIGH);
+        if (key_ok[k]) n_ok++;
+        Serial.printf("K%d=%d%s ", k + 1, digitalRead(KEY_PIN[k]),
+                      key_ok[k] ? "" : "[비활성]");
+    }
+    Serial.printf("(%d/%d 사용)\n", n_ok, N_KEYS);
+    Serial.println("  K1짧게=마크토글  K1길게=기준선재학습  K2=임계값−  K3=임계값+");
+    Serial.println("  K4=채널고정  K5짧게=BLE리셋 K5길게=통계  K6=통계");
+    if (!key_ok[5]) Serial.println("  ※ K6 비활성 — 통계는 K5 를 길게 누르세요");
+
+    // ── LED 후보 전부 출력으로
+    for (int i = 0; i < N_LED; i++) { pinMode(LED_PIN[i], OUTPUT); digitalWrite(LED_PIN[i], LOW); }
+    Serial.printf("[led] 후보 %d핀 구동 (GPIO", N_LED);
+    for (int i = 0; i < N_LED; i++) Serial.printf("%s%d", i ? "/" : "", LED_PIN[i]);
+    Serial.println(") — 하나가 LED 면 표시등이 된다");
+
+    // ── PSRAM: CSI 원시 링 + 추론 스크래치
+    if (psramFound()) {
+        ring_iq = (int8_t *)heap_caps_malloc((size_t)RING_N * 2 * MAX_SC, MALLOC_CAP_SPIRAM);
+        ring_ms = (uint32_t *)heap_caps_malloc((size_t)RING_N * 4, MALLOC_CAP_SPIRAM);
+        void *sc = heap_caps_malloc(cn_scratch_bytes(), MALLOC_CAP_SPIRAM);
+        infer_win = (float *)heap_caps_malloc(
+            (size_t)CN_N_FRAMES * CN_N_MELS * sizeof(float), MALLOC_CAP_SPIRAM);
+        infer_packed = (int8_t *)heap_caps_malloc((size_t)CF_MAX_IN * 2 * MAX_SC,
+                                                 MALLOC_CAP_SPIRAM);
+        infer_wms = (uint32_t *)heap_caps_malloc((size_t)CF_MAX_IN * 4, MALLOC_CAP_SPIRAM);
+        infer_scr = (float *)heap_caps_malloc((size_t)CF_MAX_IN * MAX_SC * sizeof(float),
+                                             MALLOC_CAP_SPIRAM);
+        if (ring_iq && ring_ms && sc && infer_win && infer_packed && infer_wms && infer_scr) {
+            cn_ctx_init(&infer_ctx, cn_weights, sc);
+            float err = 0.0f;
+            const int rc = cn_selftest(&infer_ctx, &err);
+            Serial.printf("[모델] 자기검증 %s (오차 %.2e) — 파라미터 %u, 프로토타입 %d\n",
+                          rc == 0 ? "통과" : "실패", err,
+                          (unsigned)(sizeof(cn_weights) / sizeof(float)), CN_N_PROTO);
+            infer_ready = (rc == 0);
+            Serial.printf("[psram] 링 %dKB + 추론 %dKB + 창 %dKB\n",
+                          (int)((size_t)RING_N * 2 * MAX_SC / 1024),
+                          (int)(cn_scratch_bytes() / 1024),
+                          (int)((size_t)CN_N_FRAMES * CN_N_MELS * 4 / 1024));
+            Serial.println("      ※ 현재 모델은 '채널 분류기' 다 — 위치 라벨이 없어 그걸로 학습했다.");
+            Serial.println("        라이브 CSI 로 사슬이 도는지 확인하는 용도이고, 위치 데이터가");
+            Serial.println("        오면 모델만 바꾸면 된다.");
+        } else {
+            Serial.println("[psram] 할당 실패 — 통계만으로 진행");
+        }
+    }
+
+    Serial.printf("\n기준선 학습 중 (채널당 %d 프레임). 주변에서 움직이지 마세요.\n",
                   WARMUP_N);
+    Serial.println("준비되면 K1 을 눌러 마크하고 보드 앞을 지나가세요 — 보드가 스스로 검증합니다.\n");
 }
 
 void loop()
@@ -228,12 +429,72 @@ void loop()
     }
     const float band = (wmax > ble_dev_score) ? wmax : ble_dev_score;
 
+    // ── 온보드 추론. 현재 채널의 최근 프레임으로 창을 만들어 모델에 넣는다.
+    //    라이브 CSI 로 프런트엔드→인코더→매칭이 도는지 확인하는 것이 목적이다.
+    if (infer_ready && ring_w > 40) {
+        // 현재 채널의 프레임 인덱스를 최신순으로 모은다. 인덱스만 담으므로 작다.
+        uint16_t idxs[CF_MAX_IN];
+        int k = 0;
+        const uint32_t total = ring_w;
+        const uint32_t have = (total < RING_N) ? total : RING_N;
+        for (uint32_t i2 = 0; i2 < have && k < CF_MAX_IN; i2++) {
+            const uint32_t idx = (total - 1 - i2) % RING_N;
+            // 채널이 섞이면 주파수 응답이 섞여 무의미하다 — 현재 채널만.
+            if (ring_ch[idx] != cur_wch_i) continue;
+            idxs[k++] = (uint16_t)idx;
+        }
+        if (k >= 8) {
+            // 시간순으로 되집어 PSRAM 버퍼에 연속 배치한다 (보간이 단조를 요구한다).
+            for (int a = 0; a < k; a++) {
+                const uint32_t src = idxs[k - 1 - a];
+                memcpy(infer_packed + (size_t)a * 2 * n_sc,
+                       ring_iq + (size_t)src * 2 * MAX_SC, (size_t)2 * n_sc);
+                infer_wms[a] = ring_ms[src];
+            }
+            const uint32_t t0 = millis();
+            if (cf_window(infer_packed, infer_wms, k, n_sc, CN_N_FRAMES,
+                          CSI_CLIP, CSI_EPS, infer_scr, infer_win) == 0) {
+                float emb[CN_EMB_DIM];
+                cn_encode(&infer_ctx, infer_win, emb);
+                float sc2 = 0.0f;
+                const int best = cn_match(emb, cn_protos, CN_N_PROTO, &sc2);
+                last_cls = (best >= 0) ? cn_proto_class[best] : -1;
+                last_score = sc2;
+                infer_ms = millis() - t0;
+                infer_n++;
+            }
+        }
+    }
+
+    // 마크/비마크로 나눠 누적한다. 기준선이 다 준비된 뒤부터만 센다.
+    if (ready == N_WCH) {
+        const bool hit = band > thresh;
+        if (marked) { m_sum += band; m_sq += (double)band * band; m_n++; if (hit) m_hit++; }
+        else        { u_sum += band; u_sq += (double)band * band; u_n++; if (hit) u_hit++; }
+    }
+
     Serial.printf("ch");
     for (int i = 0; i < N_WCH; i++)
         Serial.printf("%s%d:%s%.1f", i ? " " : "", WCH_MHZ[i],
                       base_ok[i] ? "" : "(학습)", base_ok[i] ? w_dev[i] : 0.0f);
-    Serial.printf("  | BLE %d/%d 흔들림 (유효%d, %lu광고) 점수%.1f  | 대역 %.1f%s  sc%d 준비%d/%d\n",
+    // LED: 학습 중 = 느린 깜빡임, 준비 = 켜짐, 감지 = 빠른 깜빡임
+    {
+        static bool on = false;
+        const bool det = band > thresh;
+        if (ready < N_WCH) on = !on;                 // 1Hz 깜빡
+        else if (det)      on = !on;                 // 리포트마다 토글 (빠르게 보임)
+        else               on = true;                // 준비됨 = 켜짐
+        for (int i = 0; i < N_LED; i++) digitalWrite(LED_PIN[i], on ? HIGH : LOW);
+    }
+
+    if (infer_ready)
+        Serial.printf("        [모델] 클래스%d 코사인%.2f %lums (%lu회)\n",
+                      last_cls, last_score, (unsigned long)infer_ms,
+                      (unsigned long)infer_n);
+    Serial.printf("%s  | BLE %d/%d (유효%d, %lu광고) 점수%.1f  | 대역 %.1f%s  sc%d 준비%d/%d\n",
+                  marked ? "  [마크]" : "        ",
                   ble_hot, ble_valid, ble_valid, (unsigned long)ble_pkt,
-                  ble_dev_score, band, (band > 3.0f) ? "  <<< 움직임" : "",
+                  ble_dev_score, band, (band > thresh) ? "  <<< 움직임" : "",
                   n_sc, ready, N_WCH);
+    if (marked) Serial.print("");
 }
