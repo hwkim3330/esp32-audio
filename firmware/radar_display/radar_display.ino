@@ -95,6 +95,7 @@ static uint32_t acc_n[N_WCH] = { 0, 0, 0 };
 static volatile float w_dev[N_WCH] = { 0, 0, 0 };
 static volatile uint32_t w_pkt[N_WCH] = { 0, 0, 0 };
 static volatile uint8_t cur_wch_i = 0;
+static uint32_t ch_t = 0;      // 마지막 채널 전환 시각. 추론 쪽에서도 본다.
 static uint8_t n_sc = 0;
 
 // ── BLE RSSI. 광고 채널은 하드웨어가 자동 순환하므로 채널을 지정할 수 없다.
@@ -110,6 +111,13 @@ static volatile int ble_valid = 0, ble_hot = 0;
 // 채널당 기준선 프레임 수. 채널을 순환하므로 너무 크면 학습이 안 끝난다
 // (실측: 60프레임에 50초 동안 3채널 중 1개만 준비됐다).
 #define WARMUP_N 40
+
+// 채널 체류 시간. 6초였는데 그중 앞 2초는 링에 이 채널 프레임이 없어 창을 못 만든다.
+// 그래서 추론 175회에 프레임 부족 건너뜀이 181회였다 — 절반 넘게 헛돌았다.
+// 10초로 늘리면 쓸 수 있는 구간이 4초 → 8초가 되어 비율이 뒤집힌다. 대가는 한
+// 채널을 다시 보기까지 18초 → 30초인데, 추세 그래프는 1초마다 찍히므로 문제없다.
+#define CH_DWELL_MS  10000
+#define CH_SETTLE_MS  2200      // 전환 직후 이만큼은 추론을 아예 시도하지 않는다
 
 // ── 버튼 6개. 화면이 없으니 버튼이 유일한 입력이고, 가장 중요한 용도는 **정답 찍기**다.
 //
@@ -133,13 +141,103 @@ static double m_sum = 0, m_sq = 0, u_sum = 0, u_sq = 0;
 static uint32_t m_n = 0, u_n = 0;
 static uint32_t m_hit = 0, u_hit = 0;      // 임계값 초과 횟수
 
+// ───────────────────────────────────────── 앵커 링크
+//
+// 지금 BLE 점수는 주변 기기 47대의 RSSI 변동에서 나온다. 그런데 그 47대의 대부분은
+// **휴대폰**이고, 휴대폰은 스스로 움직인다. 즉 신호가 흔들려도 그게 사람이 지나가서인지
+// 그 폰이 주머니 안에서 움직여서인지 구분할 수 없다. 게다가 MAC 을 랜덤화해서
+// 같은 기기를 계속 추적할 수도 없다(실측: 96대 중 82대가 이름 없는 랜덤 MAC).
+//
+// 전자종이 태그는 다르다. **벽에 붙어 있고, 움직이지 않고, MAC 을 안 바꾼다.**
+// 그러면 태그 하나가 보드-태그 사이의 **경로 하나**를 대표한다. 그 경로의 RSSI 가
+// 흔들리면 그 선분을 가로지른 것이 있다는 뜻이다 — 이게 바이스태틱 감지의 정의다.
+//
+// 태그가 4대면 서로 다른 4개 경로다. 어느 경로가 흔들리는지 보면 방향까지 좁혀진다.
+// 익명 47대의 통계보다 이쪽이 훨씬 해석 가능하다.
+#define N_ANCHOR 8
+struct Anchor {
+    uint8_t  addr[6];
+    char     name[16];
+    float    mu, sd;      // 지수 이동 평균/편차
+    int8_t   last;
+    uint32_t n;
+    float    z;           // 현재 편차 (시그마 단위)
+    bool     used;
+};
+static Anchor anchors[N_ANCHOR];
+static int    n_anchor = 0;
+static float  anchor_score = 0.0f;   // 앵커 경로 중 최대 편차
+
+// ESL 태그인가. 0xFEF0 을 광고하거나 MAC 이 FF:FF 로 시작하면 후보다.
+static bool is_anchor_addr(const uint8_t *a) { return a[0] == 0xFF && a[1] == 0xFF; }
+
+static void anchor_note(const uint8_t *a, int8_t rssi, const char *name)
+{
+    int i = -1;
+    for (int k = 0; k < n_anchor; k++)
+        if (!memcmp(anchors[k].addr, a, 6)) { i = k; break; }
+    if (i < 0) {
+        if (n_anchor >= N_ANCHOR) return;
+        i = n_anchor++;
+        memset(&anchors[i], 0, sizeof(Anchor));
+        memcpy(anchors[i].addr, a, 6);
+        anchors[i].mu = rssi;
+        anchors[i].sd = 2.0f;
+        anchors[i].n  = 1;
+        anchors[i].used = true;
+        if (name && name[0]) strncpy(anchors[i].name, name, sizeof anchors[i].name - 1);
+        return;
+    }
+    Anchor &d = anchors[i];
+    if (name && name[0] && !d.name[0]) strncpy(d.name, name, sizeof d.name - 1);
+    d.last = rssi;
+    d.n++;
+    const float e = (float)rssi - d.mu;
+    // 편차를 먼저 재고 나서 평균을 갱신한다. 순서를 바꾸면 자기 자신을 흡수해
+    // 큰 변화가 z 에 안 나타난다.
+    d.z = (d.sd > 0.5f) ? fabsf(e) / d.sd : 0.0f;
+    const float al = (d.n < 40) ? 0.1f : 0.02f;
+    d.mu += al * e;
+    d.sd += al * (fabsf(e) - d.sd);
+
+    // 앵커는 넷뿐이라 다중비교 걱정이 작다. 그리고 각 경로가 물리적으로 의미가
+    // 있으므로 **최댓값**이 맞다 — 한 경로만 가로막혀도 사람이 있는 것이다.
+    // (익명 47대에서는 최댓값이 틀렸다. 개수가 많으면 우연한 극단값이 보장된다.)
+    float mx = 0.0f;
+    for (int k = 0; k < n_anchor; k++)
+        if (anchors[k].used && anchors[k].n > 30 && anchors[k].z > mx) mx = anchors[k].z;
+    anchor_score = mx;
+}
+
 // BLE 센싱을 BLEScan 콜백으로 받는다. 원시 esp_ble_gap_* 경로를 쓰면
 // BLEDevice::init() 이 콜백을 덮어 GATT 업로드와 공존할 수 없다.
 class SenseCb : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice ad) override {
-        ble_note(ad.getAddress().getNative(), (int8_t)ad.getRSSI());
+        const uint8_t *a = ad.getAddress().getNative();
+        const int8_t r = (int8_t)ad.getRSSI();
+        ble_note(a, r);
+        // 고정 위치 앵커는 따로 센다. 익명 기기 통계에 섞으면 그 안정성이 희석된다.
+        if (is_anchor_addr(a)) {
+            const String nm = ad.haveName() ? ad.getName() : String("");
+            anchor_note(a, r, nm.c_str());
+        }
     }
 };
+
+// 대역 점수 하나로 모은다. 세 군데에서 같은 식을 되풀이하다가 앵커를 넣을 때
+// 한 곳을 빠뜨릴 뻔했다.
+//
+// 최댓값을 쓰는 이유는 널 지점 때문이다 — 어떤 주파수·경로에서 신호가 안 변해도
+// 다른 데서 변하면 사람이 있는 것이다. 단 익명 BLE 기기 점수만은 예외로 이미
+// "2σ 넘는 비율" 로 바뀌어 있다(개수가 많으면 최댓값이 다중비교로 오염된다).
+static float band_score(void)
+{
+    float b = 0.0f;
+    for (int i = 0; i < N_WCH; i++) if (base_ok[i] && w_dev[i] > b) b = w_dev[i];
+    if (ble_dev_score > b) b = ble_dev_score;
+    if (anchor_score  > b) b = anchor_score;
+    return b;
+}
 
 // ───────────────────────────────────────── 전자종이 화면
 //
@@ -167,9 +265,17 @@ static EslTag      tags[ESL_MAX_TAG];
 static int         n_tags = 0;
 static uint32_t    esl_cycle = 0;
 static uint32_t    esl_ok = 0, esl_fail = 0;
-// 흑백만 보낼까. 적색 평면을 빼면 페이로드가 9472 → 4736 바이트로 절반이고
-// 파트도 40 → 20 이 된다. 아래 A/B 로 실제 시간 차이를 잰다.
-static bool        bw_only = false;
+// **흑백만 쓴다.**
+//
+// 처음에는 속도 때문에 고민했다. 적색을 빼면 페이로드가 9472 → 4736 바이트, 파트가
+// 40 → 20 이니 절반쯤 빨라질 줄 알았다. 같은 환경에서 회차마다 번갈아 재보니
+// BWR 4074ms(11회) 대 흑백만 4327ms(8회) — **차이가 없다.** 병목이 BLE 바이트가
+// 아니라 연결 수립과 태그 자신의 전자종이 리프레시였다.
+//
+// 그래서 속도가 아니라 화면 품질로 정한다. 태그마다 적색 잔상이 다르게 남고
+// (73:04 는 BWR 로 광고하는데도 적색이 아예 안 나온다), 그 얼룩이 그래프를
+// 읽기 어렵게 만든다. 흑백만 쓰면 네 대가 똑같이 깨끗하다. 잃는 것은 없다.
+static bool        bw_only = true;
 static uint32_t    esl_ms[2] = {0, 0}, esl_n[2] = {0, 0};   // [0]=BWR, [1]=흑백만
 static uint32_t    esl_parts[2] = {0, 0}, esl_len[2] = {0, 0};
 static bool        esl_force = false;      // 버튼으로 즉시 갱신
@@ -368,6 +474,19 @@ static void print_stats()
     Serial.println("\n=== 검증 통계 ===");
     // 파이프라인 정확성. 사람 없이 자동으로 나오는 유일한 지표이므로
     // 마크 표본이 없어 아래에서 조기 반환하더라도 이건 먼저 찍는다.
+    if (n_anchor) {
+        // 앵커는 위치가 고정된 링크다. 이 z 가 조용하면 방이 조용한 것이고,
+        // 익명 기기 점수와 달리 "그 기기가 움직였을 뿐" 이라는 변명이 안 통한다.
+        Serial.printf("\n[앵커] 고정 위치 링크 %d개 — 최대 z %.2f\n", n_anchor, anchor_score);
+        for (int k = 0; k < n_anchor; k++) {
+            const Anchor &a = anchors[k];
+            Serial.printf("   %02X:%02X:%02X:%02X:%02X:%02X %-14s "
+                          "평균 %6.1f dBm  편차 %4.2f  z %4.2f  표본 %lu\n",
+                          a.addr[0], a.addr[1], a.addr[2], a.addr[3], a.addr[4], a.addr[5],
+                          a.name[0] ? a.name : "(이름없음)", a.mu, a.sd, a.z,
+                          (unsigned long)a.n);
+        }
+    }
     if (cls_tot) {
         Serial.printf("[모델] 채널 일치 %lu/%lu = %.1f%% (무작위 기대 %.0f%%)\n",
                       (unsigned long)cls_hit, (unsigned long)cls_tot,
@@ -698,16 +817,25 @@ static void render(int slot, const EslTag &t)
     u8g2.setFont(u8g2_font_helvR10_tf);
     switch (slot) {
     case 0: {   // 추세 그래프 — 가장 가까운 태그가 가장 자주 보게 되는 화면
-        float band = 0.0f;
-        for (int i = 0; i < N_WCH; i++) if (base_ok[i] && w_dev[i] > band) band = w_dev[i];
-        if (ble_dev_score > band) band = ble_dev_score;
         u8g2.setCursor(4, 34);
-        u8g2.printf("band %.1f / thr %.1f   %lu samples",
-                    band, thresh, (unsigned long)trend_n);
-        draw_trend(4, 40, ESL_W - 8, 66);
-        u8g2.setCursor(4, 124);
-        u8g2.printf("2.4GHz passive  |  wifi %d/%d/%d Hz  ble %d dev",
-                    (int)w_pkt[0] / 6, (int)w_pkt[1] / 6, (int)w_pkt[2] / 6, n_ble);
+        u8g2.printf("band %.1f / thr %.1f   anchors %d   %lu samples",
+                    band_score(), thresh, n_anchor, (unsigned long)trend_n);
+        draw_trend(4, 40, ESL_W - 8, 52);
+        // 앵커 경로별 편차를 막대로. 어느 경로가 흔들리는지가 방향 정보다.
+        {
+            int x = 4;
+            for (int k = 0; k < n_anchor && k < 4; k++) {
+                const int w = (ESL_W - 8) / 4 - 4;
+                const int bh = (int)(18.0f * fminf(anchors[k].z, 4.0f) / 4.0f);
+                cbw->drawRect(x, 96, w, 18, 0);
+                if (bh > 0) cbw->fillRect(x + 1, 96 + 18 - bh, w - 2, bh, 0);
+                x += w + 4;
+            }
+        }
+        u8g2.setCursor(4, 126);
+        u8g2.printf("anchor z %.1f | wifi %d/%d/%d Hz | ble %d dev",
+                    anchor_score, (int)w_pkt[0] / 6, (int)w_pkt[1] / 6,
+                    (int)w_pkt[2] / 6, n_ble);
         break;
     }
     case 1: {   // 모델 — 파이프라인이 보드에서 맞게 도는가
@@ -803,10 +931,7 @@ static void render(int slot, const EslTag &t)
     u8g2.setFontMode(1);
     u8g2.setForegroundColor(0);       // 적색 평면에서는 0 이 "칠한다" 다
     u8g2.setBackgroundColor(1);
-    float band = 0.0f;
-    for (int i = 0; i < N_WCH; i++) if (base_ok[i] && w_dev[i] > band) band = w_dev[i];
-    if (ble_dev_score > band) band = ble_dev_score;
-    if (band >= thresh) {
+    if (band_score() >= thresh) {
         u8g2.setFont(u8g2_font_helvB14_tf);
         u8g2.setCursor(ESL_W - 90, 16);
         u8g2.print("MOTION");
@@ -870,19 +995,14 @@ static void esl_refresh(void)
                       (unsigned long)(esl_ms[1] / esl_n[1]), (unsigned long)esl_n[1],
                       (unsigned long)esl_len[1], (unsigned long)esl_parts[1],
                       (double)(esl_ms[0] / esl_n[0]) / (double)(esl_ms[1] / esl_n[1]));
-    // 매 회차 흑백/컬러를 번갈아 써서 같은 환경에서 비교한다. 한쪽만 재고
-    // 예전 숫자와 비교하면 전파 상태 변화와 구분이 안 된다.
-    bw_only = !bw_only;
-    Serial.printf("[화면] 센싱 스캔 복귀, 다음 회차는 %s\n",
-                  bw_only ? "흑백만" : "흑백+적색");
+    Serial.println("[화면] 센싱 스캔 복귀");
 }
 
 void loop()
 {
     // WiFi 채널 순환. 채널마다 기준선이 따로이므로 전환 후 잠깐은 값이 흔들린다.
-    static uint32_t ch_t = 0;
     // 채널 체류 시간. 짧으면 기준선 학습이 오래 걸리고, 길면 감지 주기가 느려진다.
-    if (millis() - ch_t > 6000) {
+    if (millis() - ch_t > CH_DWELL_MS) {
         ch_t = millis();
         cur_wch_i = (uint8_t)((cur_wch_i + 1) % N_WCH);
         esp_wifi_set_channel(WCH[cur_wch_i], WIFI_SECOND_CHAN_NONE);
@@ -923,7 +1043,9 @@ void loop()
 
     // ── 온보드 추론. 현재 채널의 최근 프레임으로 창을 만들어 모델에 넣는다.
     //    라이브 CSI 로 프런트엔드→인코더→매칭이 도는지 확인하는 것이 목적이다.
-    if (infer_ready && ring_w > 40) {
+    // 전환 직후에는 시도조차 하지 않는다. 시도하면 건너뜀 카운터만 올라가고
+    // "왜 이렇게 많이 건너뛰나" 를 오해하게 만든다.
+    if (infer_ready && ring_w > 40 && millis() - ch_t > CH_SETTLE_MS) {
         // 현재 채널의 프레임 인덱스를 최신순으로 모은다. 인덱스만 담으므로 작다.
         uint16_t idxs[CF_MAX_IN];
         int k = 0;
@@ -986,9 +1108,7 @@ void loop()
 
     // 추세를 적재한다. 1초에 한 번이므로 72표본이면 72초 창이다.
     {
-        float b = 0.0f;
-        for (int i = 0; i < N_WCH; i++) if (base_ok[i] && w_dev[i] > b) b = w_dev[i];
-        if (ble_dev_score > b) b = ble_dev_score;
+        const float b = band_score();
         trend[trend_n % TREND_N] = b;
         trend_ch[trend_n % TREND_N] = cur_wch_i;
         trend_n++;
