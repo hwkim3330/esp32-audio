@@ -6,6 +6,10 @@
 
 WebSnap g_snap;
 
+// 시각을 받는다. RTC 도 NTP 도 없으므로 **접속한 폰이 유일한 시계 출처**다.
+// 이게 없으면 전자종이가 "가동 시간 기준" 으로만 말한다 — 모르는 것을 아는 척하지 않는다.
+void (*web_set_clock)(uint32_t epoch) = nullptr;
+
 static WebServer *srv = nullptr;
 static bool running = false;
 
@@ -177,6 +181,9 @@ async function tick(){
           '표본을 더 모으거나 임계값을 손봐야 한다.');
   }catch(e){ document.getElementById('hdr').textContent = 'disconnected — ' + e; }
 }
+// 폰 시계를 보드에 준다. 보드에는 RTC 가 없어서 이게 유일한 시각 출처다 —
+// 전자종이 기록에 "14:32" 같은 실제 시각을 적으려면 필요하다.
+fetch('/t?e=' + Math.floor(Date.now()/1000)).catch(()=>{});
 setInterval(tick, 200); tick();
 </script>
 )HTML";
@@ -235,6 +242,14 @@ void web_start(uint8_t ap_ch)
     srv = new WebServer(80);
     srv->on("/", h_root);
     srv->on("/s", h_snap);
+    srv->on("/t", []() {
+        // 폰이 자기 시계를 준다. 전자종이 기록에 실제 시각을 적기 위한 것이다.
+        if (srv->hasArg("e") && web_set_clock) {
+            const uint32_t e = (uint32_t)strtoul(srv->arg("e").c_str(), nullptr, 10);
+            if (e > 1700000000UL) { web_set_clock(e); srv->send(200, "text/plain", "ok"); return; }
+        }
+        srv->send(400, "text/plain", "no");
+    });
     srv->onNotFound([]() { srv->send(404, "text/plain", "no"); });
     srv->begin();
     running = true;

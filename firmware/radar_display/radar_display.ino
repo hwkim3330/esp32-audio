@@ -377,6 +377,134 @@ static float band_score(void)
     return b;
 }
 
+// ───────────────────────────────────────── 사건 기록
+//
+// 전자종이를 LCD 처럼 쓰지 않기 위한 것들.
+//
+// 처음에는 타이머로 계속 다시 그렸다 — 실시간 그래프가 흐르고, 지금 값이 크게 있고,
+// 주기가 되면 무조건 갱신했다. 그건 LCD 사고방식이다. 전자종이의 성질은 반대다:
+//
+//   1. 이미지 유지에 전력이 0 → 화면의 일은 "지금" 을 보여주는 것이 아니라
+//      **간직할 가치가 있는 것을 붙들고 있는 것**이다.
+//   2. 갱신이 비싸고 느리고 눈에 띈다 → 모든 갱신은 **자격을 얻어야** 한다.
+//      시간이 됐다는 것은 자격이 아니다.
+//   3. 역광 없이 종이처럼 읽힌다 → 지켜보는 매체가 아니라 **흘깃 보는** 매체다.
+//
+// 종이에 맞는 것은 대시보드가 아니라 **기록**이다. 그래서 사건을 적는다.
+//
+// 그리고 결정적인 것: **보드가 죽어도 전자종이는 마지막 화면을 그대로 보여준다.**
+// 시각이 없는 화면은 멈춰 있어도 살아 있는 것처럼 보인다. 그래서 모든 페이지에
+// "언제 기준" 과 데이터 나이를 박는다. 종이는 거짓말을 하면 안 된다.
+#define N_EVENT 24
+struct Event {
+    uint32_t t_start;      // 시작 시각 (uptime ms)
+    uint16_t dur_s;        // 지속 시간
+    float    peak;         // 최고 점수
+    uint8_t  hot_anchor;   // 가장 흔들린 앵커의 MAC 마지막 바이트
+};
+static Event   events[N_EVENT];
+static uint8_t ev_w = 0;
+static uint32_t ev_total = 0;
+
+// 사건 판정. 히스테리시스를 둔다 — 임계값 하나로 켜고 끄면 경계에서 사건이
+// 수십 개로 쪼개지고, 그러면 기록이 쓸모없어진다.
+static bool     ev_active = false;
+static uint32_t ev_t0 = 0, ev_last_hi = 0;
+static float    ev_peak = 0.0f;
+static uint8_t  ev_hot = 0;
+#define EV_ON_MULT   1.0f      // 임계값 그대로 넘으면 시작
+#define EV_OFF_MULT  0.7f      // 70% 아래로 내려가야 종료 (히스테리시스)
+#define EV_MIN_MS    2000      // 2초 미만은 잡음으로 본다
+#define EV_GAP_MS    5000      // 5초 안에 다시 오르면 같은 사건으로 본다
+
+// 시간별/일별 집계. 종이는 "지금" 보다 "오늘 어땠나" 에 맞는 매체다.
+static uint8_t  hour_cnt[24];
+static uint8_t  day_cnt[7];
+
+// 실제 시각. RTC 가 없으므로 웹 UI 에 접속한 폰이 알려준다(/t?e=<epoch>).
+// 없으면 가동 시간 기준으로만 말한다 — 모르는 것을 아는 척하지 않는다.
+static uint32_t epoch_base = 0;    // epoch - millis()/1000
+static bool     have_clock = false;
+
+static uint32_t now_epoch(void) { return epoch_base + millis() / 1000; }
+
+// 폰이 시각을 줬다. NVS 에 남겨 재부팅 후에도 대략 맞게 쓴다 — 정확하진 않지만
+// "언제 기준" 을 아예 못 적는 것보다 낫고, 화면에 부팅 횟수도 같이 적으니
+// 재부팅 뒤 값이라는 것을 사람이 알 수 있다.
+static void on_clock(uint32_t epoch)
+{
+    epoch_base = epoch - millis() / 1000;
+    have_clock = true;
+    prefs.putUInt("epoch", epoch);
+    prefs.putUInt("epms", millis() / 1000);
+    Serial.printf("[시계] 폰이 알려줌 — %02lu:%02lu 로 맞춤\n",
+                  (unsigned long)((epoch / 3600) % 24), (unsigned long)((epoch / 60) % 60));
+    mark_dirty("시계 설정");
+}
+
+// 갱신 요청 플래그. 사건이 끝났을 때, 판정이 바뀔 때, 시간이 넘어갈 때만 켜진다.
+static bool  esl_dirty = false;
+static const char *dirty_why = "";
+
+static void mark_dirty(const char *why) { esl_dirty = true; dirty_why = why; }
+
+static void event_tick(float band)
+{
+    const uint32_t now = millis();
+    if (band >= thresh * EV_ON_MULT) {
+        if (!ev_active) {
+            // 방금 끝난 사건과 5초 안이면 이어붙인다 — 사람이 왕복하면 점수가
+            // 오르내리는데 그걸 사건 열 개로 적으면 기록이 못 쓸 것이 된다.
+            if (ev_total && now - ev_last_hi < EV_GAP_MS) {
+                ev_active = true;
+                ev_w = (uint8_t)((ev_w + N_EVENT - 1) % N_EVENT);   // 마지막 것을 되살린다
+                ev_total--;
+                ev_t0 = events[ev_w].t_start;
+                ev_peak = events[ev_w].peak;
+            } else {
+                ev_active = true;
+                ev_t0 = now;
+                ev_peak = 0.0f;
+            }
+        }
+        if (band > ev_peak) {
+            ev_peak = band;
+            // 어느 앵커가 가장 흔들렸나 — 방향 정보다.
+            float mx = 0.0f;
+            for (int k = 0; k < n_anchor; k++)
+                if (anchors[k].z > mx) { mx = anchors[k].z; ev_hot = anchors[k].addr[5]; }
+        }
+        ev_last_hi = now;
+        return;
+    }
+    if (!ev_active) return;
+    if (band > thresh * EV_OFF_MULT) return;          // 아직 히스테리시스 안
+    if (now - ev_last_hi < 1500) return;              // 잠깐 내려간 것은 무시
+
+    ev_active = false;
+    const uint32_t dur = now - ev_t0;
+    if (dur < EV_MIN_MS) return;                      // 잡음
+
+    Event &e = events[ev_w];
+    e.t_start = ev_t0;
+    e.dur_s = (uint16_t)((dur / 1000 > 65535) ? 65535 : dur / 1000);
+    e.peak = ev_peak;
+    e.hot_anchor = ev_hot;
+    ev_w = (uint8_t)((ev_w + 1) % N_EVENT);
+    ev_total++;
+
+    if (have_clock) {
+        const uint32_t h = (now_epoch() / 3600) % 24;
+        if (hour_cnt[h] < 255) hour_cnt[h]++;
+        const uint32_t d = (now_epoch() / 86400) % 7;
+        if (day_cnt[d] < 255) day_cnt[d]++;
+    }
+    Serial.printf("\n[사건] #%lu  %us 동안, 최고 %.1f, 앵커 :%02X — 화면 갱신 예약\n",
+                  (unsigned long)ev_total, e.dur_s, e.peak, e.hot_anchor);
+    // **사건이 끝났을 때가 종이에 적을 때다.** 진행 중에 적으면 잉크만 쓴다.
+    mark_dirty("사건 종료");
+}
+
 // ───────────────────────────────────────── 전자종이 화면
 //
 // 이 보드에 화면이 없다는 것이 이 프로젝트 내내 가장 큰 제약이었다. 대역 점수도,
@@ -431,6 +559,32 @@ static bool        draw_red = false;  // 다만 적색에 아무것도 그리지
 static uint32_t    esl_ms[2] = {0, 0}, esl_n[2] = {0, 0};   // [0]=BWR, [1]=흑백만
 static uint32_t    esl_parts[2] = {0, 0}, esl_len[2] = {0, 0};
 static bool        esl_force = false;      // 버튼으로 즉시 갱신
+
+// ── 태그별 갱신 주기. **자기 시간 축에 맞춘다.**
+//
+// 처음에는 90초마다 네 대를 전부 갱신했다. 하루 960회 × 4대다. 이 태그들은 소매점
+// 가격표용이라 **하루 몇 번** 갱신을 전제로 코인셀 하나로 몇 년 버티게 설계된 것이고,
+// 지금 이미 2.7~2.8V 를 보고한다(범위 2.2~3.0V, 약 69%).
+//
+// 더 근본적으로 **6시간 창을 90초마다 갱신하는 것은 의미가 없다** — 90초에 6시간
+// 그래프는 눈에 보이게 변하지 않는다. 각 축의 한 칸이 만들어지는 데 걸리는 시간이
+// 1/10/50/300초이고 칸이 72개이므로, 갱신 주기는 그 축에서 **칸 몇 개가 새로 생기는
+// 시간**이면 충분하다. 여기서는 대략 칸 6개 분량으로 잡았다(단 최소 2분).
+//
+// 결과: 하루 720 + 120 + 48 + 24 = 912회가 아니라 태그별로 720/120/48/24 회다.
+// 가장 부담이 큰 태그0 도 절반으로 줄고, 6시간 태그는 40분의 1이 된다.
+// 사건이 잦을 때 같은 태그를 연달아 굽지 않게 하는 **하한**이다. 주기가 아니다 —
+// 갱신은 사건이 결정하고, 이건 "너무 자주는 안 된다" 만 말한다.
+// 페이지 성격에 따라 다르다: 사건 목록은 자주 바뀌어도 되고, 6시간 그래프는 아니다.
+static const uint32_t MIN_GAP_MS[N_SCALE] = { 120000, 600000, 900000, 1800000 };
+static uint32_t   tag_next[ESL_MAX_TAG];       // 태그별 다음 갱신 시각
+static float      tag_v0[ESL_MAX_TAG];         // 처음 본 전압
+static uint32_t   tag_v0_ms[ESL_MAX_TAG];      // 그때 시각
+static uint32_t   tag_refreshes[ESL_MAX_TAG];  // 지금까지 갱신 횟수
+
+// 이 전압 아래로는 갱신하지 않는다. 전자종이를 낮은 전압에서 구동하면 부분만
+// 바뀌어 화면이 깨지고, 셀도 더 상한다. 모델 표의 하한이 2.2V 이므로 여유를 둔다.
+#define V_CUTOFF 2.35f
 static int         page_shift = 0;         // 어느 페이지를 어느 태그에 보낼지
 
 // ───────────────────────────────────────── 능동 프로빙
@@ -910,6 +1064,7 @@ void setup()
     Serial.println("  K6짧게=통계  K6길게=웹모드(SoftAP \"CABIN-NODE\"/cabinnode, 채널 고정)");
 
     store_load();
+    web_set_clock = on_clock;
     watch_init();
 
     // ── LED 후보 전부 출력으로
@@ -1012,47 +1167,155 @@ static void render(int slot, const EslTag &t)
     cbw->drawFastHLine(0, 21, ESL_W, 0);
 
     u8g2.setFont(u8g2_font_helvR10_tf);
-    // 네 대 모두 **같은 신호의 다른 시간 축**을 그린다.
+    // 네 페이지는 **대시보드가 아니라 기록**이다.
     //
-    // 처음에는 태그마다 다른 내용(그래프/모델/전파이웃/태그정보)을 넣었다. 그런데
-    // 그래프가 한 대에만 나오니 나머지 세 대는 한 번 보면 다시 볼 이유가 없는 표였다.
-    // 전자종이는 전원을 끊어도 화면이 남고 갱신이 느리다 — 그 성질에 맞는 것은
-    // **긴 시간 축**이다. 6시간 창은 화면을 자꾸 고치는 기기로는 못 보여준다.
+    //   0. 지금 상태 + 최근 사건 목록  — 종이 한 장으로 "무슨 일이 있었나"
+    //   1. 시간별 24시간 히스토그램     — "오늘 언제 붐볐나"
+    //   2. 추세 그래프 (6시간)          — 종이에 맞는 유일한 그래프는 긴 것이다
+    //   3. 장비 상태 + 검증 판정        — 흘깃 볼 일이 거의 없는 것
     //
-    // 상세 표는 K5(페이지 회전)로 볼 수 있게 남겨뒀다.
-    const int sl = slot % N_SCALE;
+    // 모든 페이지 아래에 **언제 기준인지**를 박는다. 전자종이는 보드가 죽어도 화면이
+    // 남으므로, 시각이 없으면 멈춘 화면이 살아 있는 것처럼 거짓말을 한다.
+    const int page = slot % 4;
     u8g2.setFont(u8g2_font_helvR10_tf);
 
-    u8g2.setCursor(4, 34);
-    u8g2.printf("%s window   band %.1f / thr %.1f   %lu bars",
-                SCALE_NAME[sl], band_score(), thresh, (unsigned long)trend_n[sl]);
+    if (page == 0) {
+        // ── 지금 상태를 한 줄로 크게. 흘깃 보는 매체이므로 이게 제일 중요하다.
+        u8g2.setFont(u8g2_font_helvB14_tf);
+        u8g2.setCursor(4, 42);
+        if (ev_active)
+            u8g2.print("MOTION NOW");
+        else if (ev_total) {
+            const Event &e = events[(ev_w + N_EVENT - 1) % N_EVENT];
+            const uint32_t ago_s = (millis() - (e.t_start + e.dur_s * 1000UL)) / 1000;
+            if (ago_s < 3600) u8g2.printf("QUIET  %lum", (unsigned long)(ago_s / 60));
+            else              u8g2.printf("QUIET  %luh", (unsigned long)(ago_s / 3600));
+        } else
+            u8g2.print("QUIET");
 
-    draw_trend(sl, 4, 40, ESL_W - 8, 58);
+        u8g2.setFont(u8g2_font_5x7_tf);
+        u8g2.setCursor(150, 34);
+        u8g2.printf("events today %lu", (unsigned long)ev_total);
+        u8g2.setCursor(150, 42);
+        u8g2.printf("band %.1f / thr %.1f", band_score(), thresh);
 
-    // 앵커 4경로 편차. 어느 경로가 흔들리는지가 방향 정보다.
-    {
-        int x = 4;
+        // ── 최근 사건 목록. 이게 종이가 잘하는 일이다 — 기록.
+        cbw->drawFastHLine(0, 48, ESL_W, 0);
+        u8g2.setFont(u8g2_font_5x7_tf);
+        u8g2.setCursor(4, 58);
+        u8g2.print("recent events        when      lasted   peak   link");
+        int y = 68, shown = 0;
+        for (int k = 0; k < N_EVENT && shown < 6; k++) {
+            const int idx = (ev_w + N_EVENT - 1 - k) % N_EVENT;
+            const Event &e = events[idx];
+            if (!e.t_start) continue;
+            const uint32_t ago = (millis() - e.t_start) / 1000;
+            u8g2.setCursor(4, y);
+            if (have_clock) {
+                const uint32_t ep = now_epoch() - ago;
+                u8g2.printf("%2lu.", (unsigned long)(ev_total - k));
+                u8g2.setCursor(30, y);
+                u8g2.printf("%02lu:%02lu", (unsigned long)((ep / 3600) % 24),
+                            (unsigned long)((ep / 60) % 60));
+            } else {
+                u8g2.printf("%2lu.", (unsigned long)(ev_total - k));
+                u8g2.setCursor(30, y);
+                if (ago < 3600) u8g2.printf("-%lum", (unsigned long)(ago / 60));
+                else            u8g2.printf("-%luh", (unsigned long)(ago / 3600));
+            }
+            u8g2.setCursor(100, y); u8g2.printf("%us", e.dur_s);
+            u8g2.setCursor(150, y); u8g2.printf("%.1f", e.peak);
+            u8g2.setCursor(200, y); u8g2.printf(":%02X", e.hot_anchor);
+            y += 9; shown++;
+        }
+        if (!shown) { u8g2.setCursor(4, 70); u8g2.print("(none yet)"); }
+
+    } else if (page == 1) {
+        u8g2.setFont(u8g2_font_5x7_tf);
+        u8g2.setCursor(4, 32);
+        u8g2.print(have_clock ? "events per hour (24 h)"
+                              : "events per hour — clock unset, open web UI to set");
+        // 24칸 막대. 종이는 "오늘 언제 붐볐나" 를 붙들고 있기에 알맞다.
+        const int bw = (ESL_W - 20) / 24;
+        uint8_t mx = 1;
+        for (int h = 0; h < 24; h++) if (hour_cnt[h] > mx) mx = hour_cnt[h];
+        for (int h = 0; h < 24; h++) {
+            const int x = 10 + h * bw;
+            const int bh = (int)(56.0f * hour_cnt[h] / mx);
+            cbw->drawRect(x, 40, bw - 1, 56, 0);
+            if (bh > 0) cbw->fillRect(x + 1, 40 + 56 - bh, bw - 3, bh, 0);
+            if (!(h % 3)) { u8g2.setCursor(x, 105); u8g2.printf("%d", h); }
+        }
+        u8g2.setCursor(4, 105); u8g2.printf("max %u", mx);
+
+    } else if (page == 2) {
+        // 종이에 맞는 유일한 그래프는 **긴 것**이다. 6시간 창은 자꾸 고치는
+        // 화면으로는 보여줄 수 없고, 전원을 끊어도 남는 화면에는 딱 맞는다.
+        u8g2.setFont(u8g2_font_5x7_tf);
+        u8g2.setCursor(4, 32);
+        u8g2.printf("band score — 6 hour window   (thr %.1f, dotted)", thresh);
+        draw_trend(3, 4, 38, ESL_W - 8, 62);
+
+    } else {
+        u8g2.setFont(u8g2_font_5x7_tf);
+        int y = 32;
+        u8g2.setCursor(4, y);
+        u8g2.printf("ESP32-A1S  boot %lu  up %luh%02lum  free %uKB",
+                    (unsigned long)boot_n, (unsigned long)(millis() / 3600000UL),
+                    (unsigned long)(millis() / 60000UL % 60),
+                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024)); y += 10;
+        u8g2.setCursor(4, y);
+        u8g2.printf("CSI sc%d   inference %lums   ch-match %lu/%lu",
+                    n_sc, (unsigned long)infer_ms, (unsigned long)cls_hit,
+                    (unsigned long)cls_tot); y += 10;
+        u8g2.setCursor(4, y);
+        u8g2.printf("BLE %d dev   anchors %d   web %s", n_ble, n_anchor,
+                    web_running() ? "ON" : "off"); y += 12;
         for (int k = 0; k < n_anchor && k < 4; k++) {
-            const int w = (ESL_W - 8) / 4 - 4;
-            const int bh = (int)(14.0f * fminf(anchors[k].z, 4.0f) / 4.0f);
-            cbw->drawRect(x, 102, w, 14, 0);
-            if (bh > 0) cbw->fillRect(x + 1, 102 + 14 - bh, w - 2, bh, 0);
-            u8g2.setFont(u8g2_font_5x7_tf);
-            u8g2.setCursor(x + 2, 100);
-            u8g2.printf("%02X %.1f", anchors[k].addr[5], anchors[k].z);
-            x += w + 4;
+            u8g2.setCursor(4, y);
+            u8g2.printf("anchor :%02X  %d dBm  sd %.1f  z %.1f  %.2fV  %lu refresh",
+                        anchors[k].addr[5], anchors[k].last, anchors[k].sd, anchors[k].z,
+                        (k < ESL_MAX_TAG) ? tags[k].volts : 0.0f,
+                        (unsigned long)((k < ESL_MAX_TAG) ? tag_refreshes[k] : 0));
+            y += 10;
+        }
+        y += 4;
+        u8g2.setCursor(4, y);
+        if (m_n < 10) u8g2.print("HUMAN DETECTION UNVERIFIED — press K1, walk 30 s");
+        else {
+            const double mm = m_sum / m_n, um = u_sum / u_n;
+            const double sm = sqrt(fmax(m_sq / m_n - mm * mm, 0.0));
+            const double su = sqrt(fmax(u_sq / u_n - um * um, 0.0));
+            const double pl = sqrt((sm * sm + su * su) / 2.0);
+            const double d = (pl > 1e-9) ? (mm - um) / pl : 0.0;
+            u8g2.printf("verified: d = %.2f  (%s)  mark %lu / idle %lu", d,
+                        d >= 0.8 ? "detector works" : "insufficient",
+                        (unsigned long)m_n, (unsigned long)u_n);
         }
     }
 
+    // ── 모든 페이지 공통: **언제 기준인가.**
+    //    전자종이는 보드가 죽어도 화면이 남는다. 시각이 없으면 멈춘 화면이
+    //    살아 있는 것처럼 거짓말을 한다. 이 한 줄이 그것을 막는다.
+    cbw->drawFastHLine(0, 116, ESL_W, 0);
     u8g2.setFont(u8g2_font_5x7_tf);
     u8g2.setCursor(4, 126);
-    u8g2.printf("boot %lu  up %luh%02lum | infer %lums %lu/%lu ch-match | "
-                "ble %d | sc%d | mark %lu/%lu",
-                (unsigned long)boot_n, (unsigned long)(millis() / 3600000UL),
-                (unsigned long)(millis() / 60000UL % 60),
-                (unsigned long)infer_ms, (unsigned long)cls_hit,
-                (unsigned long)cls_tot, n_ble, n_sc,
-                (unsigned long)m_n, (unsigned long)u_n);
+    if (have_clock) {
+        const uint32_t ep = now_epoch();
+        u8g2.printf("drawn %02lu:%02lu:%02lu  |  up %luh%02lum  |  refresh #%lu  |  %s",
+                    (unsigned long)((ep / 3600) % 24), (unsigned long)((ep / 60) % 60),
+                    (unsigned long)(ep % 60),
+                    (unsigned long)(millis() / 3600000UL),
+                    (unsigned long)(millis() / 60000UL % 60),
+                    (unsigned long)esl_cycle, dirty_why);
+    } else {
+        u8g2.printf("drawn at uptime %luh%02lum%02lus  |  refresh #%lu  |  %s"
+                    "  |  clock unset",
+                    (unsigned long)(millis() / 3600000UL),
+                    (unsigned long)(millis() / 60000UL % 60),
+                    (unsigned long)(millis() / 1000UL % 60),
+                    (unsigned long)esl_cycle, dirty_why);
+    }
 
     // ── 적색 평면은 위에서 fillScreen(1)(=적색 없음)로 비워뒀고, 그대로 보낸다.
     //    그래야 이전 회차의 적색이 지워진다. 여기서 return 하면 "안 그린다" 이지
@@ -1094,9 +1357,26 @@ static void render(int slot, const EslTag &t)
 
 // 화면 갱신. 업로드 동안만 프로미스큐어스를 내린다 — BLE GATT 전송과 WiFi
 // 스니핑을 동시에 하면 한쪽이 굶는다. 링은 유지되므로 CSI 는 몇 초만 빈다.
+static bool esl_forced_now = false;
+
 static void esl_refresh(void)
 {
     if (!cbw || !esl_buf) return;
+
+    // 아무 태그도 주기가 안 됐으면 **스캔조차 하지 않는다.**
+    //
+    // esl_scan 은 6초 동안 센싱 스캔을 빼앗는다. 30초마다 확인하면서 매번 스캔하면
+    // 센싱이 20% 쉬는 셈이고, 앵커 추적이 그만큼 끊긴다. 태그 주소는 지난 스캔의
+    // 목록에 남아 있으므로 주기 판단은 스캔 없이 할 수 있다.
+    if (!esl_forced_now && n_tags) {
+        bool any_due = false;
+        for (int i = 0; i < n_tags; i++) {
+            const int slot = (i + page_shift) % N_SCALE;
+            (void)slot;
+            if (!tag_next[i] || (int32_t)(millis() - tag_next[i]) >= 0) { any_due = true; break; }
+        }
+        if (!any_due) return;
+    }
 
     // 스캔 소유권을 넘겨받는다.
     //
@@ -1111,8 +1391,44 @@ static void esl_refresh(void)
     esp_wifi_set_promiscuous(false);
     n_tags = esl_scan(tags, ESL_MAX_TAG, 6);
     Serial.printf("\n[화면] 태그 %d대\n", n_tags);
+    int n_done = 0;
     for (int i = 0; i < n_tags; i++) {
-        render((i + page_shift) % 4, tags[i]);
+        const int slot = (i + page_shift) % N_SCALE;
+
+        // 배터리 감소율을 **측정한다.** 태그가 광고에 전압을 싣기 때문에 추측할
+        // 필요가 없다. 처음 본 값과 지금 값의 차이를 가동 시간으로 나눈다.
+        if (tags[i].have_mfg && tags[i].volts > 0.5f) {
+            if (tag_v0[i] < 0.5f) { tag_v0[i] = tags[i].volts; tag_v0_ms[i] = millis(); }
+            const uint32_t dt = millis() - tag_v0_ms[i];
+            const float dv = tag_v0[i] - tags[i].volts;
+            if (dt > 600000UL && dv > 0.005f) {
+                // 남은 용량을 2.2V 까지로 보고 선형 외삽한다. 셀 방전 곡선은 선형이
+                // 아니므로 어림값이지만, "며칠" 과 "몇 달" 을 가르기에는 충분하다.
+                const float per_h = dv / (dt / 3600000.0f);
+                const float left_h = (tags[i].volts - 2.2f) / per_h;
+                Serial.printf("  #%d 전압 %.2f→%.2fV, %.1f시간 동안 -%.3fV "
+                              "→ 시간당 -%.4fV, 남은 추정 %.0f시간(%.1f일), 갱신 %lu회\n",
+                              i, tag_v0[i], tags[i].volts, dt / 3600000.0f, dv,
+                              per_h, left_h, left_h / 24.0f,
+                              (unsigned long)tag_refreshes[i]);
+            }
+        }
+
+        // 전압이 낮으면 건드리지 않는다. 낮은 전압 구동은 화면을 깨고 셀을 더 상하게 한다.
+        if (tags[i].have_mfg && tags[i].volts > 0.5f && tags[i].volts < V_CUTOFF) {
+            Serial.printf("  #%d %s  %.2fV — 하한 %.2fV 미만이라 건너뛴다\n",
+                          i, tags[i].name, tags[i].volts, V_CUTOFF);
+            continue;
+        }
+
+        // 자기 시간 축의 주기가 안 됐으면 건너뛴다. 강제 갱신(K4)은 예외다.
+        if (!esl_forced_now && tag_next[i] && (int32_t)(millis() - tag_next[i]) < 0)
+            continue;
+        tag_next[i] = millis() + MIN_GAP_MS[slot];
+        tag_refreshes[i]++;
+        n_done++;
+
+        render(slot, tags[i]);
         const size_t len = esl_pack(tags[i], *cbw, *cred, esl_buf, bw_only);
         uint32_t ms = 0, parts = 0;
         const EslResult r = esl_upload(tags[i].addr, esl_buf, len, &ms, &parts);
@@ -1319,6 +1635,10 @@ void loop()
         } else g_snap.cohen_d = 0.0f;
     }
 
+    // 사건을 판정한다. 화면 갱신은 여기서만 예약된다 — 시간이 됐다는 것은
+    // 갱신할 자격이 아니다.
+    event_tick(band_score());
+
     // 추세를 적재한다. 1초에 한 번이므로 72표본이면 72초 창이다.
     {
         const float b = band_score();
@@ -1337,8 +1657,37 @@ void loop()
     // 화면 갱신. 전자종이는 태그당 3.5초 걸리므로 자주 할 수 없고, 할 이유도 없다.
     // 90초 주기면 추세 그래프가 늘 최근 72초를 보여준다.
     static uint32_t esl_t = 0;
-    if (esl_force || (trend_n[0] > 20 && millis() - esl_t > 90000)) {
-        esl_force = false; esl_t = millis(); esl_refresh();
+    // ── 화면 갱신은 **자격을 얻어야** 한다.
+    //
+    // 예전에는 90초 타이머였다. 그건 LCD 방식이다 — 방이 6시간 비어 있어도 똑같은
+    // 빈 그래프를 240번 다시 그린다. 전자종이는 이미지 유지에 전력이 0 이므로
+    // 아무 일도 없으면 **그냥 그대로 두는 것이 정답**이다.
+    //
+    // 갱신하는 이유는 넷뿐이다:
+    //   1. 사건이 끝났다 (mark_dirty — 종이에 적을 것이 생겼다)
+    //   2. 시간이 넘어갔다 (시간별 히스토그램의 칸이 바뀐다)
+    //   3. 검증 판정이 바뀌었다 (미검증 → 검증됨)
+    //   4. 너무 오래 안 그렸다 — 화면이 멈춘 것과 방이 조용한 것을 구별하려면
+    //      살아 있다는 표시가 주기적으로 필요하다. 그래서 최대 정체 시간을 둔다.
+    {
+        static uint32_t last_hour = 99, last_verdict = 0;
+        const uint32_t h = have_clock ? ((now_epoch() / 3600) % 24) : 99;
+        if (h != last_hour && last_hour != 99) { last_hour = h; mark_dirty("시간 경계"); }
+        else last_hour = h;
+
+        const uint32_t v = (m_n >= 10) ? 2 : (m_n ? 1 : 0);
+        if (v != last_verdict) { last_verdict = v; mark_dirty("검증 상태 변화"); }
+
+        // 최대 정체 30분. 이게 배터리 하한을 정한다 — 아무 일이 없어도
+        // 하루 48회 × 4대다. 90초 타이머의 960회에 비해 20분의 1이다.
+        if (millis() - esl_t > 1800000UL) mark_dirty("생존 표시");
+    }
+
+    if (esl_force || esl_dirty) {
+        esl_forced_now = esl_force;   // 버튼으로 부른 것인지 사건으로 부른 것인지
+        esl_force = false; esl_dirty = false; esl_t = millis();
+        esl_refresh();
+        esl_forced_now = false;
     }
 
     // 60초마다 자동으로 혼동행렬을 뱉는다. 버튼을 누를 사람이 없어도

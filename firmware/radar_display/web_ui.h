@@ -49,3 +49,7 @@ struct WebSnap {
     float    cohen_d;
 };
 extern WebSnap g_snap;
+
+// 폰이 /t?e=<epoch> 로 시각을 주면 호출된다. 보드에 RTC 가 없으므로 이것이
+// 실제 시각의 유일한 출처다. 스케치가 여기에 자기 함수를 꽂는다.
+extern void (*web_set_clock)(uint32_t epoch);
