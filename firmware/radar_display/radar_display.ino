@@ -40,6 +40,7 @@
 #include "prototypes.h"
 #include "selftest.h"
 #include "esl_bwr.h"
+#include "web_ui.h"
 
 void ble_note(const uint8_t *bda, int8_t rssi);
 
@@ -146,7 +147,17 @@ static volatile int ble_valid = 0, ble_hot = 0;
 // 것" 이 구별되지 않는다. 그래서 아래에서 **모든 키에 LED 응답**을 붙였다.
 static const int KEY_PIN[N_KEYS] = { 36, 13, 19, 23, 18, 5 };
 static bool key_ok[N_KEYS] = { false };
-static volatile bool  marked = false;
+// 마크는 **한 번 누르면 30초 동안 켜지고 스스로 꺼진다.**
+//
+// 처음에는 토글이었다. 누르고 걷고 다시 눌러 끄는 방식인데, 실기에서 표본이 하나도
+// 안 남았다(마크 0 / 비마크 676). 끄는 것을 기억해야 하는 설계 자체가 문제다 —
+// 검증은 한 번만 하면 되는 일이니 사람이 할 일은 "누르고 걷기" 하나여야 한다.
+//
+// 30초는 대역 점수가 1초에 한 표본이므로 30표본이다. Cohen's d 를 내기에 최소한이고,
+// 사람이 방을 몇 번 왕복하기에 충분하다. 여러 번 눌러 쌓으면 표본이 늘어난다.
+#define MARK_MS 30000
+static volatile bool     marked = false;
+static uint32_t          mark_until = 0;
 static volatile float thresh = 3.0f;
 static volatile bool  ch_lock = false;
 
@@ -379,11 +390,22 @@ static float band_score(void)
 // 내린다(esp_wifi_deinit). 우리는 CSI 를 계속 받아야 하므로 그럴 수 없다.
 // 그래서 업로드 동안만 프로미스큐어스를 끄고, 끝나면 되돌린다 — CSI 는 그 몇 초만
 // 비고 링은 유지된다.
-#define TREND_N   72          // 추세 표본 수. 296픽셀 폭에 4픽셀씩이면 72개다.
-static float    trend[TREND_N];
-static uint8_t  trend_ch[TREND_N];
-static int      trend_w = 0;
-static uint32_t trend_n = 0;
+// 추세를 **네 개의 시간 축으로** 동시에 쌓는다.
+//
+// 전자종이는 갱신이 느리지만 전원을 끊어도 화면이 남는다. 그러면 네 대를 같은 신호의
+// 서로 다른 시간 축에 쓰는 것이 가장 값지다 — 1분 창 하나만 보면 "지금 뭔가 지나갔다"
+// 까지만 알 수 있고, 6시간 창이 있으면 "이 방은 밤에 조용하다" 를 알 수 있다.
+//
+// 각 축은 1초 표본을 N개씩 모아 한 칸을 만든다. 평균이 아니라 **최댓값**을 쓴다 —
+// 3초 지나간 사람을 300초로 평균하면 사라진다.
+#define TREND_N   72          // 296픽셀 폭에 4픽셀씩이면 72칸이다
+#define N_SCALE   4
+static const uint16_t SCALE_SEC[N_SCALE]  = { 1, 10, 50, 300 };   // 칸당 초
+static const char    *SCALE_NAME[N_SCALE] = { "72 s", "12 min", "1 hr", "6 hr" };
+static float    trend[N_SCALE][TREND_N];
+static uint32_t trend_n[N_SCALE];
+static float    acc_max[N_SCALE];
+static uint16_t acc_cnt[N_SCALE];
 
 static GFXcanvas1 *cbw = nullptr, *cred = nullptr;
 static uint8_t    *esl_buf = nullptr;
@@ -705,6 +727,10 @@ static void keys_poll()
                 ch_lock = !ch_lock;
                 Serial.printf("[key] 채널 %s\n", ch_lock ? "고정" : "순환");
             } else if (k == 4) print_stats();
+            else if (k == 5) {
+                // 웹 모드. 채널이 고정되므로 기본이 아니라 눌러서 켜는 모드다.
+                if (web_running()) web_stop(); else web_start(WCH[1]);   // ch6
+            }
         } else if (!d && down[k]) {
             down[k] = false;
             if (longed[k]) continue;
@@ -713,9 +739,11 @@ static void keys_poll()
             Serial.printf("[key] K%d 눌림 (GPIO%d)\n", k + 1, KEY_PIN[k]);
             switch (k) {
             case 0:
-                marked = !marked;
-                Serial.printf("[key] 마크 %s\n", marked ? "ON — 사람 있음" : "OFF");
-                if (!marked) store_save("마크 종료");   // 표본을 모은 직후에 남긴다
+                marked = true;
+                mark_until = millis() + MARK_MS;
+                Serial.printf("\n[검증] 마크 시작 — 앞으로 %d초 동안 보드 앞을 "
+                              "왕복해 주세요. 끝나면 스스로 판정합니다.\n",
+                              MARK_MS / 1000);
                 break;
             case 1:
                 if (thresh > 1.0f) thresh -= 0.5f;
@@ -763,7 +791,12 @@ void setup()
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_filter(nullptr);
     wifi_csi_config_t cfg = {};
-    cfg.lltf_en = true; cfg.htltf_en = true; cfg.stbc_htltf2_en = true;
+    // **LLTF 만 받는다.** 셋 다 켜면 한 프레임에 세 벌(64+64+64=192 서브캐리어)이
+    // 실려 오고, 프레임 종류에 따라 64/128/192 로 개수가 들쭉날쭉해진다.
+    // 모델은 64개로 학습됐으므로 그걸 버리면 파이프라인이 굶고(실측: 창이 4프레임까지
+    // 줄고 추론이 159회에서 멈췄다), 안 버리면 링의 행이 어긋난다.
+    // 애초에 한 벌만 오게 하는 것이 답이다. 학습 데이터도 LLTF 64개였다.
+    cfg.lltf_en = true; cfg.htltf_en = false; cfg.stbc_htltf2_en = false;
     cfg.ltf_merge_en = true; cfg.channel_filter_en = true;
         cfg.manu_scale = false; cfg.shift = 0;
     // ACK 의 CSI 를 받는다. PROBE_NULL 방식은 이게 켜져 있어야 의미가 있다 —
@@ -873,7 +906,8 @@ void setup()
     }
     Serial.printf("— %d개 전부 사용\n", N_KEYS);
     Serial.println("  K1짧게=마크토글  K1길게=기준선재학습  K2=임계값−  K3=임계값+");
-    Serial.println("  K4짧게=화면즉시갱신 K4길게=채널고정  K5짧게=페이지회전 K5길게=통계  K6=통계");
+    Serial.println("  K4짧게=화면즉시갱신 K4길게=채널고정  K5짧게=페이지회전 K5길게=통계");
+    Serial.println("  K6짧게=통계  K6길게=웹모드(SoftAP \"CABIN-NODE\"/cabinnode, 채널 고정)");
 
     store_load();
     watch_init();
@@ -922,7 +956,7 @@ void setup()
 }
 
 // 대역 점수 추세를 그린다. 전자종이가 가장 잘하는 일이다.
-static void draw_trend(int x0, int y0, int w, int h)
+static void draw_trend(int sl, int x0, int y0, int w, int h)
 {
     cbw->drawFastHLine(x0, y0 + h, w, 0);        // 시간축
     cbw->drawFastVLine(x0, y0, h, 0);            // 값축
@@ -933,13 +967,14 @@ static void draw_trend(int x0, int y0, int w, int h)
     if (ty > y0 && ty < y0 + h)
         for (int x = x0; x < x0 + w; x += 4) cbw->drawPixel(x, ty, 0);
 
-    if (!trend_n) return;
-    const int n = (trend_n < TREND_N) ? (int)trend_n : TREND_N;
+    if (!trend_n[sl]) return;
+    const uint32_t tn = trend_n[sl];
+    const int n = (tn < TREND_N) ? (int)tn : TREND_N;
     const int step = (w - 2) / TREND_N;
     for (int i = 0; i < n; i++) {
         // 오래된 것이 왼쪽. 링 버퍼를 시간순으로 읽는다.
-        const int idx = (int)((trend_n - n + i) % TREND_N);
-        float v = trend[idx];
+        const int idx = (int)((tn - n + i) % TREND_N);
+        float v = trend[sl][idx];
         if (v > vmax) v = vmax;
         const int bh = (int)(h * (v / vmax));
         const int x = x0 + 2 + i * step;
@@ -977,99 +1012,47 @@ static void render(int slot, const EslTag &t)
     cbw->drawFastHLine(0, 21, ESL_W, 0);
 
     u8g2.setFont(u8g2_font_helvR10_tf);
-    switch (slot) {
-    case 0: {   // 추세 그래프 — 가장 가까운 태그가 가장 자주 보게 되는 화면
-        u8g2.setCursor(4, 34);
-        u8g2.printf("band %.1f / thr %.1f   anchors %d   %lu samples",
-                    band_score(), thresh, n_anchor, (unsigned long)trend_n);
-        draw_trend(4, 40, ESL_W - 8, 52);
-        // 앵커 경로별 편차를 막대로. 어느 경로가 흔들리는지가 방향 정보다.
-        {
-            int x = 4;
-            for (int k = 0; k < n_anchor && k < 4; k++) {
-                const int w = (ESL_W - 8) / 4 - 4;
-                const int bh = (int)(18.0f * fminf(anchors[k].z, 4.0f) / 4.0f);
-                cbw->drawRect(x, 96, w, 18, 0);
-                if (bh > 0) cbw->fillRect(x + 1, 96 + 18 - bh, w - 2, bh, 0);
-                x += w + 4;
-            }
+    // 네 대 모두 **같은 신호의 다른 시간 축**을 그린다.
+    //
+    // 처음에는 태그마다 다른 내용(그래프/모델/전파이웃/태그정보)을 넣었다. 그런데
+    // 그래프가 한 대에만 나오니 나머지 세 대는 한 번 보면 다시 볼 이유가 없는 표였다.
+    // 전자종이는 전원을 끊어도 화면이 남고 갱신이 느리다 — 그 성질에 맞는 것은
+    // **긴 시간 축**이다. 6시간 창은 화면을 자꾸 고치는 기기로는 못 보여준다.
+    //
+    // 상세 표는 K5(페이지 회전)로 볼 수 있게 남겨뒀다.
+    const int sl = slot % N_SCALE;
+    u8g2.setFont(u8g2_font_helvR10_tf);
+
+    u8g2.setCursor(4, 34);
+    u8g2.printf("%s window   band %.1f / thr %.1f   %lu bars",
+                SCALE_NAME[sl], band_score(), thresh, (unsigned long)trend_n[sl]);
+
+    draw_trend(sl, 4, 40, ESL_W - 8, 58);
+
+    // 앵커 4경로 편차. 어느 경로가 흔들리는지가 방향 정보다.
+    {
+        int x = 4;
+        for (int k = 0; k < n_anchor && k < 4; k++) {
+            const int w = (ESL_W - 8) / 4 - 4;
+            const int bh = (int)(14.0f * fminf(anchors[k].z, 4.0f) / 4.0f);
+            cbw->drawRect(x, 102, w, 14, 0);
+            if (bh > 0) cbw->fillRect(x + 1, 102 + 14 - bh, w - 2, bh, 0);
+            u8g2.setFont(u8g2_font_5x7_tf);
+            u8g2.setCursor(x + 2, 100);
+            u8g2.printf("%02X %.1f", anchors[k].addr[5], anchors[k].z);
+            x += w + 4;
         }
-        u8g2.setCursor(4, 126);
-        u8g2.printf("boot %lu  up %luh%02lum | anchor z %.1f | ble %d",
-                    (unsigned long)boot_n, (unsigned long)(millis() / 3600000UL),
-                    (unsigned long)(millis() / 60000UL % 60), anchor_score, n_ble);
-        if (false) u8g2.printf("anchor z %.1f | wifi %d/%d/%d Hz | ble %d dev",
-                    anchor_score, (int)w_pkt[0] / 6, (int)w_pkt[1] / 6,
-                    (int)w_pkt[2] / 6, n_ble);
-        break;
     }
-    case 1: {   // 모델 — 파이프라인이 보드에서 맞게 도는가
-        int y = 40;
-        u8g2.setCursor(4, y);
-        u8g2.printf("on-device inference   %lu ms", (unsigned long)infer_ms); y += 16;
-        u8g2.setCursor(4, y);
-        u8g2.printf("channel match  %lu/%lu = %.0f%%   (random 33%%)",
-                    (unsigned long)cls_hit, (unsigned long)cls_tot,
-                    cls_tot ? 100.0 * cls_hit / cls_tot : 0.0); y += 16;
-        for (int a = 0; a < N_WCH; a++) {
-            uint32_t r = 0;
-            for (int b = 0; b < N_WCH; b++) r += cls_cm[a][b];
-            u8g2.setCursor(4, y);
-            u8g2.printf("ch%d %4d MHz : %4lu %4lu %4lu   diag %.0f%%",
-                        a, WCH_MHZ[a], (unsigned long)cls_cm[a][0],
-                        (unsigned long)cls_cm[a][1], (unsigned long)cls_cm[a][2],
-                        r ? 100.0 * cls_cm[a][a] / r : 0.0);
-            y += 16;
-        }
-        u8g2.setCursor(4, 124);
-        u8g2.printf("window %lu frames / %lu ms   skipped %lu",
-                    (unsigned long)win_n, (unsigned long)win_span_ms,
-                    (unsigned long)win_skip);
-        break;
-    }
-    case 2: {   // 전파 이웃
-        int y = 40;
-        u8g2.setCursor(4, y);
-        u8g2.printf("WiFi ch1/6/11 pkt  %lu / %lu / %lu",
-                    (unsigned long)w_pkt[0], (unsigned long)w_pkt[1],
-                    (unsigned long)w_pkt[2]); y += 16;
-        for (int i = 0; i < N_WCH; i++) {
-            u8g2.setCursor(4, y);
-            if (ap_ok[i])
-                u8g2.printf("ch%d AP %02X:%02X:%02X:%02X:%02X:%02X  %d dBm", i,
-                            ap_mac[i][0], ap_mac[i][1], ap_mac[i][2],
-                            ap_mac[i][3], ap_mac[i][4], ap_mac[i][5], ap_rssi[i]);
-            else
-                u8g2.printf("ch%d  no AP", i);
-            y += 16;
-        }
-        u8g2.setCursor(4, y);
-        u8g2.printf("BLE  %d dev   %lu adv   hot %d", n_ble,
-                    (unsigned long)ble_pkt, (int)(ble_dev_score * n_ble / 10.0f));
-        u8g2.setCursor(4, 124);
-        u8g2.printf("probing %s  tx %lu fail %lu", probe_on ? "on" : "off",
-                    (unsigned long)probe_tx, (unsigned long)probe_fail);
-        break;
-    }
-    default: {  // 이 태그 자신 — 어느 태그가 어느 역할인지 알아야 벽에 붙일 수 있다
-        int y = 40;
-        u8g2.setCursor(4, y);  u8g2.printf("%s", t.name[0] ? t.name : "(no name)"); y += 16;
-        u8g2.setCursor(4, y);
-        u8g2.printf("%02X:%02X:%02X:%02X:%02X:%02X   %d dBm",
-                    t.addr[0], t.addr[1], t.addr[2], t.addr[3], t.addr[4], t.addr[5],
-                    t.rssi); y += 16;
-        u8g2.setCursor(4, y);
-        u8g2.printf("%s   id 0x%04X   fw 0x%04X",
-                    t.m ? t.m->model : "unknown model", t.device_id, t.firmware); y += 16;
-        u8g2.setCursor(4, y);
-        u8g2.printf("battery %.1f V   %s", t.volts,
-                    (t.m && !t.m->red) ? "BW only" : "black + red"); y += 16;
-        u8g2.setCursor(4, y);
-        u8g2.printf("uploads ok %lu  fail %lu", (unsigned long)esl_ok,
-                    (unsigned long)esl_fail);
-        break;
-    }
-    }
+
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.setCursor(4, 126);
+    u8g2.printf("boot %lu  up %luh%02lum | infer %lums %lu/%lu ch-match | "
+                "ble %d | sc%d | mark %lu/%lu",
+                (unsigned long)boot_n, (unsigned long)(millis() / 3600000UL),
+                (unsigned long)(millis() / 60000UL % 60),
+                (unsigned long)infer_ms, (unsigned long)cls_hit,
+                (unsigned long)cls_tot, n_ble, n_sc,
+                (unsigned long)m_n, (unsigned long)u_n);
 
     // ── 적색 평면은 위에서 fillScreen(1)(=적색 없음)로 비워뒀고, 그대로 보낸다.
     //    그래야 이전 회차의 적색이 지워진다. 여기서 return 하면 "안 그린다" 이지
@@ -1172,7 +1155,8 @@ void loop()
 {
     // WiFi 채널 순환. 채널마다 기준선이 따로이므로 전환 후 잠깐은 값이 흔들린다.
     // 채널 체류 시간. 짧으면 기준선 학습이 오래 걸리고, 길면 감지 주기가 느려진다.
-    if (millis() - ch_t > CH_DWELL_MS) {
+    // 웹 모드에서는 채널을 고정한다 — SoftAP 가 채널을 옮기면 붙은 폰이 끊긴다.
+    if (!web_running() && !ch_lock && millis() - ch_t > CH_DWELL_MS) {
         ch_t = millis();
         cur_wch_i = (uint8_t)((cur_wch_i + 1) % N_WCH);
         esp_wifi_set_channel(WCH[cur_wch_i], WIFI_SECOND_CHAN_NONE);
@@ -1197,6 +1181,7 @@ void loop()
     const uint32_t probe_iv = (probe_mode == 1) ? 40 : 100;
     if (probe_on && millis() - probe_t >= probe_iv) { probe_t = millis(); probe_send(); }
 
+    web_poll();     // 요청 처리. 막지 않으므로 CSI 콜백을 방해하지 않는다.
     watch_poll();   // 50Hz 로 훑는다. 사람 손가락에는 충분하다.
     blink_poll();   // LED 응답 큐. 막지 않으므로 CSI 를 놓치지 않는다.
 
@@ -1279,18 +1264,80 @@ void loop()
         }
     }
 
+    // 마크 자동 종료. 끝나는 즉시 판정하고 저장한다 — 사람이 결과를 보러 돌아올
+    // 필요가 없어야 한다.
+    if (marked && (int32_t)(millis() - mark_until) >= 0) {
+        marked = false;
+        Serial.println("\n[검증] 마크 종료 — 판정합니다.");
+        print_stats();
+        store_save("마크 종료");
+        esl_force = true;      // 화면도 곧바로 갱신해 결과를 보여준다
+    }
+
+    // ── 웹 스냅샷을 채운다. 웹 코드가 센싱 내부를 직접 들여다보지 않게 여기서만 쓴다.
+    {
+        g_snap.n_sc = n_sc;
+        // 마지막으로 받은 프레임의 진폭을 dB 스케일로 옮긴다. 링의 최신 행을 쓴다.
+        if (ring_iq && ring_w) {
+            const int8_t *row = ring_iq + (size_t)((ring_w - 1) % RING_N) * 2 * MAX_SC;
+            for (int f = 0; f < n_sc && f < 128; f++) {
+                const float im = row[2 * f], re = row[2 * f + 1];
+                const float a = sqrtf(im * im + re * re);
+                // 20*log10 을 -128..127 로. 진폭 1 → -128, 진폭 90 → +100 근처.
+                float db = (a > 0.5f) ? (60.0f * log10f(a) - 128.0f) : -128.0f;
+                if (db > 127.0f) db = 127.0f;
+                if (db < -128.0f) db = -128.0f;
+                g_snap.amp[f] = (int8_t)db;
+            }
+        }
+        g_snap.band = band_score();
+        g_snap.thresh = thresh;
+        g_snap.n_anchor = (uint8_t)n_anchor;
+        for (int k = 0; k < n_anchor && k < 8; k++) {
+            g_snap.anchor_z[k] = anchors[k].z;
+            g_snap.anchor_last[k] = anchors[k].addr[5];
+            g_snap.anchor_rssi[k] = anchors[k].last;
+        }
+        g_snap.infer_ms = infer_ms;
+        g_snap.cls_hit = cls_hit; g_snap.cls_tot = cls_tot;
+        g_snap.last_cls = last_cls; g_snap.last_score = last_score;
+        g_snap.n_ble = n_ble; g_snap.ble_adv = ble_pkt;
+        // 1초 리포트 주기이므로 이번 초의 프레임 수가 곧 Hz 다.
+        static uint32_t prev_frames = 0;
+        const uint32_t now_frames = ring_w;
+        g_snap.csi_hz = now_frames - prev_frames;
+        prev_frames = now_frames;
+        g_snap.uptime_s = millis() / 1000;
+        g_snap.boot_n = boot_n;
+        g_snap.mark_n = m_n; g_snap.unmark_n = u_n;
+        if (m_n >= 2 && u_n >= 2) {
+            const double mm = m_sum / m_n, um = u_sum / u_n;
+            const double sm = sqrt(fmax(m_sq / m_n - mm * mm, 0.0));
+            const double su = sqrt(fmax(u_sq / u_n - um * um, 0.0));
+            const double pooled = sqrt((sm * sm + su * su) / 2.0);
+            g_snap.cohen_d = (pooled > 1e-9) ? (float)((mm - um) / pooled) : 0.0f;
+        } else g_snap.cohen_d = 0.0f;
+    }
+
     // 추세를 적재한다. 1초에 한 번이므로 72표본이면 72초 창이다.
     {
         const float b = band_score();
-        trend[trend_n % TREND_N] = b;
-        trend_ch[trend_n % TREND_N] = cur_wch_i;
-        trend_n++;
+        for (int sl = 0; sl < N_SCALE; sl++) {
+            // 최댓값으로 모은다. 평균이면 3초 지나간 사람이 300초 칸에서 사라진다.
+            if (b > acc_max[sl]) acc_max[sl] = b;
+            if (++acc_cnt[sl] >= SCALE_SEC[sl]) {
+                trend[sl][trend_n[sl] % TREND_N] = acc_max[sl];
+                trend_n[sl]++;
+                acc_max[sl] = 0.0f;
+                acc_cnt[sl] = 0;
+            }
+        }
     }
 
     // 화면 갱신. 전자종이는 태그당 3.5초 걸리므로 자주 할 수 없고, 할 이유도 없다.
     // 90초 주기면 추세 그래프가 늘 최근 72초를 보여준다.
     static uint32_t esl_t = 0;
-    if (esl_force || (trend_n > 20 && millis() - esl_t > 90000)) {
+    if (esl_force || (trend_n[0] > 20 && millis() - esl_t > 90000)) {
         esl_force = false; esl_t = millis(); esl_refresh();
     }
 
