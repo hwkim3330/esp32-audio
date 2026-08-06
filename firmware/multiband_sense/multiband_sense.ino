@@ -113,7 +113,17 @@ static volatile int ble_valid = 0, ble_hot = 0;
 //   K4 = 채널 고정/순환 토글         K5 짧게 = BLE 표 리셋, 길게 = 통계 요약
 //   K6 = 통계 요약
 #define N_KEYS 6
-static const int KEY_PIN[N_KEYS] = { 19, 23, 18, 5, 36, 13 };
+// **실기로 확정한 매핑** (핀 변화 감시기로 KEY1..KEY6 을 순서대로 눌러 확인).
+//   KEY1=GPIO36  KEY2=GPIO13  KEY3=GPIO19  KEY4=GPIO23  KEY5=GPIO18  KEY6=GPIO5
+//
+// 처음에는 { 19, 23, 18, 5, 36, 13 } 이었다 — **두 칸 밀려 있었다.** 그래서
+// "3번 키만 반응한다" 는 증상이 나왔다. 물리 KEY3(GPIO19)이 코드에서는 K1 =
+// 마크 토글이었고, 마크 토글만 LED 패턴이라는 눈에 보이는 효과가 있었다.
+// 나머지 다섯 개는 잘 작동하면서 시리얼에만 찍혔다.
+//
+// 교훈: 화면도 LED 도 없이 시리얼로만 확인하면 "안 되는 것" 과 "되는데 안 보이는
+// 것" 이 구별되지 않는다. 그래서 아래에서 **모든 키에 LED 응답**을 붙였다.
+static const int KEY_PIN[N_KEYS] = { 36, 13, 19, 23, 18, 5 };
 static bool key_ok[N_KEYS] = { false };
 static volatile bool  marked = false;
 static volatile float thresh = 3.0f;

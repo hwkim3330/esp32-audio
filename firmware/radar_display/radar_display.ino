@@ -33,6 +33,7 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <Preferences.h>
 
 #include "cn_infer.h"      // 학습된 인코더 추론 (음성과 같은 엔진, 조건 컴파일로 로그멜 제외)
 #include "csi_front.h"     // CSI 창 프런트엔드 — 파이썬과 1.371e-06 로 대조됨
@@ -95,6 +96,9 @@ static uint32_t acc_n[N_WCH] = { 0, 0, 0 };
 static volatile float w_dev[N_WCH] = { 0, 0, 0 };
 static volatile uint32_t w_pkt[N_WCH] = { 0, 0, 0 };
 static volatile uint8_t cur_wch_i = 0;
+// 서브캐리어 개수가 기대와 다른 프레임 수. 0 이 아니면 AP 대역폭이 섞인 것이다.
+static volatile uint32_t sc_mismatch = 0;
+static volatile uint16_t sc_other = 0;
 static uint32_t ch_t = 0;      // 마지막 채널 전환 시각. 추론 쪽에서도 본다.
 static uint8_t n_sc = 0;
 
@@ -130,7 +134,17 @@ static volatile int ble_valid = 0, ble_hot = 0;
 //   K4 = 채널 고정/순환 토글         K5 짧게 = BLE 표 리셋, 길게 = 통계 요약
 //   K6 = 통계 요약
 #define N_KEYS 6
-static const int KEY_PIN[N_KEYS] = { 19, 23, 18, 5, 36, 13 };
+// **실기로 확정한 매핑** (핀 변화 감시기로 KEY1..KEY6 을 순서대로 눌러 확인).
+//   KEY1=GPIO36  KEY2=GPIO13  KEY3=GPIO19  KEY4=GPIO23  KEY5=GPIO18  KEY6=GPIO5
+//
+// 처음에는 { 19, 23, 18, 5, 36, 13 } 이었다 — **두 칸 밀려 있었다.** 그래서
+// "3번 키만 반응한다" 는 증상이 나왔다. 물리 KEY3(GPIO19)이 코드에서는 K1 =
+// 마크 토글이었고, 마크 토글만 LED 패턴이라는 눈에 보이는 효과가 있었다.
+// 나머지 다섯 개는 잘 작동하면서 시리얼에만 찍혔다.
+//
+// 교훈: 화면도 LED 도 없이 시리얼로만 확인하면 "안 되는 것" 과 "되는데 안 보이는
+// 것" 이 구별되지 않는다. 그래서 아래에서 **모든 키에 LED 응답**을 붙였다.
+static const int KEY_PIN[N_KEYS] = { 36, 13, 19, 23, 18, 5 };
 static bool key_ok[N_KEYS] = { false };
 static volatile bool  marked = false;
 static volatile float thresh = 3.0f;
@@ -140,6 +154,75 @@ static volatile bool  ch_lock = false;
 static double m_sum = 0, m_sq = 0, u_sum = 0, u_sq = 0;
 static uint32_t m_n = 0, u_n = 0;
 static uint32_t m_hit = 0, u_hit = 0;      // 임계값 초과 횟수
+
+// 키를 누르면 **누른 키 번호만큼 LED 를 깜빡인다.**
+//
+// 이게 없어서 "3번 키만 반응한다" 는 오진이 나왔다. 여섯 개 다 작동하는데 다섯 개는
+// 시리얼에만 찍혀서 안 보였을 뿐이다. 화면도 없는 보드에서는 즉시 보이는 응답이
+// 있어야 "먹었는지" 를 알 수 있다. 막는 방식(delay)으로 짜면 CSI 프레임을 놓치므로
+// 큐로 만든다.
+static volatile int  blink_left = 0;      // 남은 깜빡임 횟수 (×2 = 켜고 끄기)
+static uint32_t      blink_t = 0;
+#define BLINK_MS 120
+
+static void led_all(bool on)
+{
+    for (int i = 0; i < N_LED; i++) digitalWrite(LED_PIN[i], on ? HIGH : LOW);
+}
+
+
+static void blink_ack(int key_1based) { blink_left = key_1based * 2; }
+
+static void blink_poll(void)
+{
+    if (blink_left <= 0) return;
+    if (millis() - blink_t < BLINK_MS) return;
+    blink_t = millis();
+    led_all((blink_left & 1) != 0);       // 홀수 남으면 켠다
+    blink_left--;
+}
+
+// ───────────────────────────────────────── 영속 저장
+//
+// 재부팅하면 전부 사라진다는 것이 이 펌웨어의 가장 큰 구멍이었다. 벽에 붙여둘
+// 센서인데 며칠에 걸쳐 증거를 모을 수 없으면 K1 검증(마크/비마크 분리도)이
+// 무의미하다 — 사람이 한 번 지나가는 것으로는 표본이 안 모인다.
+//
+// NVS 에 남기는 것은 **누적된 증거와 사람이 정한 값**뿐이다. 기준선(base_mu/sd)은
+// 일부러 안 남긴다 — 전파 환경은 시간이 지나면 바뀌므로 묵은 기준선을 되살리면
+// 부팅 직후 유령 감지가 난다. 다시 배우는 데 40프레임이면 된다.
+static Preferences prefs;
+static uint32_t boot_n = 0;
+
+static void store_load(void)
+{
+    prefs.begin("radar", false);
+    boot_n = prefs.getUInt("boot", 0) + 1;
+    prefs.putUInt("boot", boot_n);
+    thresh   = prefs.getFloat("thresh", 3.0f);
+    m_sum = prefs.getDouble("ms", 0.0); m_sq = prefs.getDouble("mq", 0.0);
+    u_sum = prefs.getDouble("us", 0.0); u_sq = prefs.getDouble("uq", 0.0);
+    m_n = prefs.getUInt("mn", 0); u_n = prefs.getUInt("un", 0);
+    m_hit = prefs.getUInt("mh", 0); u_hit = prefs.getUInt("uh", 0);
+    cls_hit = prefs.getUInt("ch", 0); cls_tot = prefs.getUInt("ct", 0);
+    prefs.getBytes("cm", (void *)cls_cm, sizeof(cls_cm));
+    Serial.printf("[저장] 부팅 %lu회째. 검증 표본 마크 %lu / 비마크 %lu, "
+                  "채널일치 %lu/%lu, 임계 %.1f\n",
+                  (unsigned long)boot_n, (unsigned long)m_n, (unsigned long)u_n,
+                  (unsigned long)cls_hit, (unsigned long)cls_tot, thresh);
+}
+
+static void store_save(const char *why)
+{
+    prefs.putFloat("thresh", thresh);
+    prefs.putDouble("ms", m_sum); prefs.putDouble("mq", m_sq);
+    prefs.putDouble("us", u_sum); prefs.putDouble("uq", u_sq);
+    prefs.putUInt("mn", m_n); prefs.putUInt("un", u_n);
+    prefs.putUInt("mh", m_hit); prefs.putUInt("uh", u_hit);
+    prefs.putUInt("ch", cls_hit); prefs.putUInt("ct", cls_tot);
+    prefs.putBytes("cm", (const void *)cls_cm, sizeof(cls_cm));
+    Serial.printf("[저장] 기록함 (%s)\n", why);
+}
 
 // ───────────────────────────────────────── 키 매핑 탐색
 //
@@ -412,9 +495,19 @@ static void IRAM_ATTR csi_cb(void *ctx, wifi_csi_info_t *info)
     // 여기서 그걸 AP 로 착각해 널 프레임을 보냈다가 ACK 을 못 받았다(실측 1.07배,
     // 송신 실패 54%). 진짜 BSSID 는 setup 의 스캔에서 채운다.
 
+    // 서브캐리어 개수는 **고정이 아니다.** 20MHz 프레임은 64개, HT40(40MHz)은 128개다.
+    // 실측으로 AP 가 HT40 으로 올라가면서 sc64 → sc128 로 바뀌었다.
+    //
+    // 이걸 그냥 받으면 조용히 망가진다. 모델은 64개로 학습됐고, 링의 한 행은
+    // 2*n_sc 바이트로 고정 배치되므로 프레임마다 개수가 다르면 행이 어긋난다.
+    // 증상은 "인식률이 왜 이러지" 로만 보이고 원인이 감춰진다.
+    //
+    // 그래서 **모델이 기대하는 개수만 받는다.** 나머지는 세어서 알린다 —
+    // 조용히 버리면 "왜 프레임이 안 들어오나" 를 또 오해하게 된다.
     const int sc = info->len / 2;
-    const int n = (sc > MAX_SC) ? MAX_SC : sc;
-    if (!n_sc) n_sc = (uint8_t)n;
+    if (!n_sc) n_sc = (uint8_t)((sc > MAX_SC) ? MAX_SC : sc);
+    if (sc != (int)n_sc) { sc_mismatch++; sc_other = (uint16_t)sc; return; }
+    const int n = n_sc;
     const int start = info->first_word_invalid ? 2 : 0;
 
     // PSRAM 링에 원시 IQ 를 적재한다 — 모델 입력용 창을 나중에 만든다.
@@ -605,6 +698,8 @@ static void keys_poll()
         if (d && !down[k]) { down[k] = true; t_down[k] = millis(); longed[k] = false; }
         else if (d && down[k] && !longed[k] && millis() - t_down[k] > 700) {
             longed[k] = true;
+            blink_ack(k + 1);
+            Serial.printf("[key] K%d 길게 (GPIO%d)\n", k + 1, KEY_PIN[k]);
             if (k == 0) reset_baseline();
             else if (k == 3) {
                 ch_lock = !ch_lock;
@@ -613,18 +708,24 @@ static void keys_poll()
         } else if (!d && down[k]) {
             down[k] = false;
             if (longed[k]) continue;
+            // 어느 키가 먹었는지 **먼저** 알린다. 아래 동작이 무엇이든 응답은 온다.
+            blink_ack(k + 1);
+            Serial.printf("[key] K%d 눌림 (GPIO%d)\n", k + 1, KEY_PIN[k]);
             switch (k) {
             case 0:
                 marked = !marked;
                 Serial.printf("[key] 마크 %s\n", marked ? "ON — 사람 있음" : "OFF");
+                if (!marked) store_save("마크 종료");   // 표본을 모은 직후에 남긴다
                 break;
             case 1:
                 if (thresh > 1.0f) thresh -= 0.5f;
                 Serial.printf("[key] 임계값 %.1f\n", thresh);
+                store_save("임계값");
                 break;
             case 2:
                 thresh += 0.5f;
                 Serial.printf("[key] 임계값 %.1f\n", thresh);
+                store_save("임계값");
                 break;
             case 3:
                 // 화면이 생긴 뒤로 가장 자주 필요한 것은 "지금 갱신해라" 다.
@@ -747,26 +848,38 @@ void setup()
         Serial.println("[ble] 수동 스캔 시작 (광고 채널 37/38/39, BLEScan 경로)");
     }
 
-    // ── 버튼. 부팅 시 LOW 로 읽히면 배선이 의심스러워 비활성한다(K6=GPIO13 실측).
+    // ── LED 를 **먼저** 설정한다. GPIO13 이 GPIO22 상태에 끌리므로 GPIO22 를
+    //    확정한 뒤에 키를 읽어야 값이 안정된다.
+    for (int i = 0; i < N_LED; i++) { pinMode(LED_PIN[i], OUTPUT); digitalWrite(LED_PIN[i], LOW); }
+
+    // ── 버튼 6개. 매핑은 핀 변화 감시기로 실기 확정했다.
     for (int k = 0; k < N_KEYS; k++)
         pinMode(KEY_PIN[k], (KEY_PIN[k] == 36 || KEY_PIN[k] == 5) ? INPUT : INPUT_PULLUP);
+    // **자동 비활성을 없앴다.**
+    //
+    // 전에는 부팅 시 LOW 로 읽히는 키를 배선 의심으로 껐다. 그게 GPIO13(KEY2)을
+    // 잡았는데, 핀 변화 감시기로 확인해보니 **KEY2 는 정상 작동한다.** LOW 로 읽힌
+    // 이유는 순서였다 — 키 스캔이 LED 핀 설정보다 먼저 돌아서 GPIO22 가 떠 있을 때
+    // 읽었고, GPIO13 은 GPIO22 상태에 끌린다(이 보드의 알려진 특성).
+    //
+    // 그래서 LED 를 먼저 설정한 뒤에 읽고, 값이 이상해도 끄지 않고 알리기만 한다.
+    // 근거 없는 자동 비활성은 "안 되는 키" 를 스스로 만들어냈다.
     Serial.print("[keys] ");
-    int n_ok = 0;
     for (int k = 0; k < N_KEYS; k++) {
-        key_ok[k] = (digitalRead(KEY_PIN[k]) == HIGH);
-        if (key_ok[k]) n_ok++;
-        Serial.printf("K%d=%d%s ", k + 1, digitalRead(KEY_PIN[k]),
-                      key_ok[k] ? "" : "[비활성]");
+        const int v = digitalRead(KEY_PIN[k]);
+        key_ok[k] = true;
+        Serial.printf("K%d(GPIO%d)=%d%s ", k + 1, KEY_PIN[k], v,
+                      v == LOW ? "[눌림? 확인]" : "");
     }
-    Serial.printf("(%d/%d 사용)\n", n_ok, N_KEYS);
+    Serial.printf("— %d개 전부 사용\n", N_KEYS);
     Serial.println("  K1짧게=마크토글  K1길게=기준선재학습  K2=임계값−  K3=임계값+");
     Serial.println("  K4짧게=화면즉시갱신 K4길게=채널고정  K5짧게=페이지회전 K5길게=통계  K6=통계");
-    if (!key_ok[5]) Serial.println("  ※ K6 비활성 — 통계는 K5 를 길게 누르세요");
 
+    store_load();
     watch_init();
 
     // ── LED 후보 전부 출력으로
-    for (int i = 0; i < N_LED; i++) { pinMode(LED_PIN[i], OUTPUT); digitalWrite(LED_PIN[i], LOW); }
+
     Serial.printf("[led] 후보 %d핀 구동 (GPIO", N_LED);
     for (int i = 0; i < N_LED; i++) Serial.printf("%s%d", i ? "/" : "", LED_PIN[i]);
     Serial.println(") — 하나가 LED 면 표시등이 된다");
@@ -882,7 +995,10 @@ static void render(int slot, const EslTag &t)
             }
         }
         u8g2.setCursor(4, 126);
-        u8g2.printf("anchor z %.1f | wifi %d/%d/%d Hz | ble %d dev",
+        u8g2.printf("boot %lu  up %luh%02lum | anchor z %.1f | ble %d",
+                    (unsigned long)boot_n, (unsigned long)(millis() / 3600000UL),
+                    (unsigned long)(millis() / 60000UL % 60), anchor_score, n_ble);
+        if (false) u8g2.printf("anchor z %.1f | wifi %d/%d/%d Hz | ble %d dev",
                     anchor_score, (int)w_pkt[0] / 6, (int)w_pkt[1] / 6,
                     (int)w_pkt[2] / 6, n_ble);
         break;
@@ -1082,6 +1198,7 @@ void loop()
     if (probe_on && millis() - probe_t >= probe_iv) { probe_t = millis(); probe_send(); }
 
     watch_poll();   // 50Hz 로 훑는다. 사람 손가락에는 충분하다.
+    blink_poll();   // LED 응답 큐. 막지 않으므로 CSI 를 놓치지 않는다.
 
     static uint32_t rep_t = 0;
     if (millis() - rep_t < 1000) { delay(20); return; }
@@ -1183,6 +1300,9 @@ void loop()
     if (cls_tot >= 20 && millis() - last_auto > 60000) {
         last_auto = millis();
         print_stats();
+        // 5분마다 남긴다. NVS 는 10만 회 쓰기 수명이라 이 주기면 1년 이상이다.
+        static uint32_t last_save = 0;
+        if (millis() - last_save > 300000) { last_save = millis(); store_save("주기"); }
     }
 
     // 마크/비마크로 나눠 누적한다. 기준선이 다 준비된 뒤부터만 센다.
@@ -1197,13 +1317,15 @@ void loop()
         Serial.printf("%s%d:%s%.1f", i ? " " : "", WCH_MHZ[i],
                       base_ok[i] ? "" : "(학습)", base_ok[i] ? w_dev[i] : 0.0f);
     // LED: 학습 중 = 느린 깜빡임, 준비 = 켜짐, 감지 = 빠른 깜빡임
-    {
+    // 단 키 응답 깜빡임 중에는 손대지 않는다 — 덮으면 키를 눌러도 안 보이고,
+    // 그게 바로 "3번 키만 반응한다" 는 오진을 만든 구조다.
+    if (blink_left <= 0) {
         static bool on = false;
-        const bool det = band > thresh;
+        const bool det = band_score() > thresh;
         if (ready < N_WCH) on = !on;                 // 1Hz 깜빡
         else if (det)      on = !on;                 // 리포트마다 토글 (빠르게 보임)
         else               on = true;                // 준비됨 = 켜짐
-        for (int i = 0; i < N_LED; i++) digitalWrite(LED_PIN[i], on ? HIGH : LOW);
+        led_all(on);
     }
 
     if (infer_ready)
@@ -1214,10 +1336,16 @@ void loop()
                       cls_tot ? 100.0 * cls_hit / cls_tot : 0.0,
                       (unsigned long)win_n, (unsigned long)win_span_ms,
                       (unsigned long)win_skip);
-    Serial.printf("%s  | BLE %d/%d (유효%d, %lu광고) 점수%.1f  | 대역 %.1f%s  sc%d 준비%d/%d\n",
+    Serial.printf("%s  | BLE %d/%d (%lu광고) 점수%.1f | 앵커%d z%.1f | 대역 %.1f%s"
+                  "  sc%d%s 준비%d/%d\n",
                   marked ? "  [마크]" : "        ",
-                  ble_hot, ble_valid, ble_valid, (unsigned long)ble_pkt,
-                  ble_dev_score, band, (band > thresh) ? "  <<< 움직임" : "",
-                  n_sc, ready, N_WCH);
+                  ble_hot, ble_valid, (unsigned long)ble_pkt, ble_dev_score,
+                  n_anchor, anchor_score,
+                  band, (band > thresh) ? "  <<< 움직임" : "", n_sc,
+                  sc_mismatch ? " (다른폭 프레임 버림)" : "", ready, N_WCH);
+    if (sc_mismatch)
+        Serial.printf("        ※ 서브캐리어 %u개인 프레임 %lu개를 버렸다 — AP 가 대역폭을"
+                      " 섞어 쓴다. 모델은 %u개로 학습됐다.\n",
+                      (unsigned)sc_other, (unsigned long)sc_mismatch, (unsigned)n_sc);
     if (marked) Serial.print("");
 }
