@@ -141,6 +141,50 @@ static double m_sum = 0, m_sq = 0, u_sum = 0, u_sq = 0;
 static uint32_t m_n = 0, u_n = 0;
 static uint32_t m_hit = 0, u_hit = 0;      // 임계값 초과 횟수
 
+// ───────────────────────────────────────── 키 매핑 탐색
+//
+// 여섯 개 중 하나만 반응한다(실기 관측). 내 매핑이 틀렸거나 핀이 다른 기능에
+// 물려 있다는 뜻이다. 짐작하지 말고 보드가 직접 알려주게 한다.
+//
+// 유력한 원인: 이 보드의 **GPIO 5/18/19/23 은 SD카드 SPI 와 겸용**이고, 가운데
+// DIP 스위치가 그걸 키와 SD 사이에서 가른다. 즉 지금 DIP 가 SD 쪽이면 그 네 개는
+// 키로 안 잡힌다. 오디오가 죽은 것의 남은 단일 용의자도 같은 DIP 스위치다 —
+// 두 증상이 한 원인일 수 있다.
+//
+// 여기서는 후보 핀을 넓게 걸어놓고 **변화가 생긴 핀 번호를 그대로 찍는다.**
+// 버튼을 하나씩 누르면 어느 핀인지 나온다.
+static const int WATCH[] = { 36, 39, 34, 35, 13, 5, 18, 19, 23, 27, 12, 14 };
+#define N_WATCH ((int)(sizeof(WATCH) / sizeof(WATCH[0])))
+static uint8_t watch_prev[N_WATCH];
+static uint32_t watch_hits[N_WATCH];
+
+static void watch_init(void)
+{
+    Serial.print("[핀탐색] 부팅 시 레벨: ");
+    for (int i = 0; i < N_WATCH; i++) {
+        const int p = WATCH[i];
+        // 34~39 는 입력 전용이라 내부 풀업이 없다. 보드에 외부 풀업이 없으면
+        // 값이 떠다니는데, 그것도 정보다("이 핀은 못 쓴다").
+        pinMode(p, (p >= 34) ? INPUT : INPUT_PULLUP);
+        watch_prev[i] = digitalRead(p);
+        Serial.printf("%d=%d ", p, watch_prev[i]);
+    }
+    Serial.println("\n[핀탐색] 버튼을 하나씩 눌러보세요 — 바뀐 핀 번호가 찍힙니다.");
+}
+
+static void watch_poll(void)
+{
+    for (int i = 0; i < N_WATCH; i++) {
+        const uint8_t v = digitalRead(WATCH[i]);
+        if (v == watch_prev[i]) continue;
+        watch_prev[i] = v;
+        watch_hits[i]++;
+        Serial.printf("[핀탐색] GPIO%-2d → %s   (이 핀 변화 %lu회)\n",
+                      WATCH[i], v ? "HIGH(뗌)" : "LOW(누름)",
+                      (unsigned long)watch_hits[i]);
+    }
+}
+
 // ───────────────────────────────────────── 앵커 링크
 //
 // 지금 BLE 점수는 주변 기기 47대의 RSSI 변동에서 나온다. 그런데 그 47대의 대부분은
@@ -265,17 +309,20 @@ static EslTag      tags[ESL_MAX_TAG];
 static int         n_tags = 0;
 static uint32_t    esl_cycle = 0;
 static uint32_t    esl_ok = 0, esl_fail = 0;
-// **흑백만 쓴다.**
+// 적색을 화면에 **안 그리되, 평면은 비워서 반드시 보낸다.**
 //
-// 처음에는 속도 때문에 고민했다. 적색을 빼면 페이로드가 9472 → 4736 바이트, 파트가
-// 40 → 20 이니 절반쯤 빨라질 줄 알았다. 같은 환경에서 회차마다 번갈아 재보니
-// BWR 4074ms(11회) 대 흑백만 4327ms(8회) — **차이가 없다.** 병목이 BLE 바이트가
-// 아니라 연결 수립과 태그 자신의 전자종이 리프레시였다.
+// 처음에는 "흑백만 보내면 되지" 라고 생각해 적색 평면을 아예 빼고 4736바이트만
+// 보냈다. 틀렸다. **전자종이는 잔류형이다.** 적색 평면을 안 보내면 태그의 적색
+// 레이어는 지워지지 않고 **이전 내용이 그대로 남는다.** 즉 흑백만 보내기는 적색을
+// 끄는 방법이 아니라 예전 적색을 박제하는 방법이었다(실기 관측: 흑백 전용으로
+// 바꾼 뒤에도 화면이 계속 빨갰다).
 //
-// 그래서 속도가 아니라 화면 품질로 정한다. 태그마다 적색 잔상이 다르게 남고
-// (73:04 는 BWR 로 광고하는데도 적색이 아예 안 나온다), 그 얼룩이 그래프를
-// 읽기 어렵게 만든다. 흑백만 쓰면 네 대가 똑같이 깨끗하다. 잃는 것은 없다.
-static bool        bw_only = true;
+// 그래서 적색 평면을 **흰색으로 채워서 함께 보낸다.** 그러면 적색 레이어가 지워진다.
+// 대가는 페이로드가 두 배(4736 → 9472)인데, 속도 차이가 없다는 것은 이미 쟀다 —
+// BWR 4074ms 대 흑백만 4327ms. 병목이 바이트가 아니라 연결 수립과 태그 자신의
+// 리프레시라서 그렇다. 그러니 잃는 것이 없다.
+static bool        bw_only = false;   // 평면은 둘 다 보낸다
+static bool        draw_red = false;  // 다만 적색에 아무것도 그리지 않는다
 static uint32_t    esl_ms[2] = {0, 0}, esl_n[2] = {0, 0};   // [0]=BWR, [1]=흑백만
 static uint32_t    esl_parts[2] = {0, 0}, esl_len[2] = {0, 0};
 static bool        esl_force = false;      // 버튼으로 즉시 갱신
@@ -716,6 +763,8 @@ void setup()
     Serial.println("  K4짧게=화면즉시갱신 K4길게=채널고정  K5짧게=페이지회전 K5길게=통계  K6=통계");
     if (!key_ok[5]) Serial.println("  ※ K6 비활성 — 통계는 K5 를 길게 누르세요");
 
+    watch_init();
+
     // ── LED 후보 전부 출력으로
     for (int i = 0; i < N_LED; i++) { pinMode(LED_PIN[i], OUTPUT); digitalWrite(LED_PIN[i], LOW); }
     Serial.printf("[led] 후보 %d핀 구동 (GPIO", N_LED);
@@ -906,6 +955,11 @@ static void render(int slot, const EslTag &t)
     }
     }
 
+    // ── 적색 평면은 위에서 fillScreen(1)(=적색 없음)로 비워뒀고, 그대로 보낸다.
+    //    그래야 이전 회차의 적색이 지워진다. 여기서 return 하면 "안 그린다" 이지
+    //    "안 보낸다" 가 아니다 — 그 구분이 이 화면의 핵심이다.
+    if (!draw_red) return;
+
     // ── 적색을 쓸 자격.
     //
     // 전자종이에서 적색의 유일한 장점은 **읽지 않아도 눈에 들어온다**는 것이다.
@@ -1026,6 +1080,8 @@ void loop()
     // 응답도 못 받으니 그냥 낭비다. 40ms(25Hz)면 2초 창에 50프레임으로 충분하다.
     const uint32_t probe_iv = (probe_mode == 1) ? 40 : 100;
     if (probe_on && millis() - probe_t >= probe_iv) { probe_t = millis(); probe_send(); }
+
+    watch_poll();   // 50Hz 로 훑는다. 사람 손가락에는 충분하다.
 
     static uint32_t rep_t = 0;
     if (millis() - rep_t < 1000) { delay(20); return; }
