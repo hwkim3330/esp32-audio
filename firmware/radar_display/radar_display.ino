@@ -28,10 +28,19 @@
 #include <esp_gap_ble_api.h>
 #include <math.h>
 
+#include <Adafruit_GFX.h>
+#include <U8g2_for_Adafruit_GFX.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
 #include "cn_infer.h"      // 학습된 인코더 추론 (음성과 같은 엔진, 조건 컴파일로 로그멜 제외)
 #include "csi_front.h"     // CSI 창 프런트엔드 — 파이썬과 1.371e-06 로 대조됨
 #include "prototypes.h"
 #include "selftest.h"
+#include "esl_bwr.h"
+
+void ble_note(const uint8_t *bda, int8_t rssi);
 
 // ── LED. 어느 GPIO 가 LED 인지 실기로 특정하지 못했다(관찰자가 없었다).
 // 그래서 안전한 후보를 전부 같은 상태 신호로 구동한다 — 하나가 LED 면 그게 표시등이 된다.
@@ -123,6 +132,48 @@ static volatile bool  ch_lock = false;
 static double m_sum = 0, m_sq = 0, u_sum = 0, u_sq = 0;
 static uint32_t m_n = 0, u_n = 0;
 static uint32_t m_hit = 0, u_hit = 0;      // 임계값 초과 횟수
+
+// BLE 센싱을 BLEScan 콜백으로 받는다. 원시 esp_ble_gap_* 경로를 쓰면
+// BLEDevice::init() 이 콜백을 덮어 GATT 업로드와 공존할 수 없다.
+class SenseCb : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice ad) override {
+        ble_note(ad.getAddress().getNative(), (int8_t)ad.getRSSI());
+    }
+};
+
+// ───────────────────────────────────────── 전자종이 화면
+//
+// 이 보드에 화면이 없다는 것이 이 프로젝트 내내 가장 큰 제약이었다. 대역 점수도,
+// 채널 일치율도, 추론 지연도 전부 시리얼로만 나왔고 그건 PC 가 붙어 있어야 한다.
+//
+// BLE 전자선반라벨(Gicisky EPD 2.9" BWR, 실측 4대)을 화면으로 쓴다. 전자종이는
+// 갱신이 느리지만(태그당 3.5초) **추세 그래프에는 오히려 알맞다** — 초당 갱신할
+// 이유가 없고, 전원을 끊어도 화면이 남는다.
+//
+// 문제는 공존이다. 참조 구현(사용자 레포)은 BLE 업로드 전에 WiFi 를 완전히
+// 내린다(esp_wifi_deinit). 우리는 CSI 를 계속 받아야 하므로 그럴 수 없다.
+// 그래서 업로드 동안만 프로미스큐어스를 끄고, 끝나면 되돌린다 — CSI 는 그 몇 초만
+// 비고 링은 유지된다.
+#define TREND_N   72          // 추세 표본 수. 296픽셀 폭에 4픽셀씩이면 72개다.
+static float    trend[TREND_N];
+static uint8_t  trend_ch[TREND_N];
+static int      trend_w = 0;
+static uint32_t trend_n = 0;
+
+static GFXcanvas1 *cbw = nullptr, *cred = nullptr;
+static uint8_t    *esl_buf = nullptr;
+static U8G2_FOR_ADAFRUIT_GFX u8g2;
+static EslTag      tags[ESL_MAX_TAG];
+static int         n_tags = 0;
+static uint32_t    esl_cycle = 0;
+static uint32_t    esl_ok = 0, esl_fail = 0;
+// 흑백만 보낼까. 적색 평면을 빼면 페이로드가 9472 → 4736 바이트로 절반이고
+// 파트도 40 → 20 이 된다. 아래 A/B 로 실제 시간 차이를 잰다.
+static bool        bw_only = false;
+static uint32_t    esl_ms[2] = {0, 0}, esl_n[2] = {0, 0};   // [0]=BWR, [1]=흑백만
+static uint32_t    esl_parts[2] = {0, 0}, esl_len[2] = {0, 0};
+static bool        esl_force = false;      // 버튼으로 즉시 갱신
+static int         page_shift = 0;         // 어느 페이지를 어느 태그에 보낼지
 
 // ───────────────────────────────────────── 능동 프로빙
 //
@@ -256,27 +307,27 @@ static void IRAM_ATTR csi_cb(void *ctx, wifi_csi_info_t *info)
 //
 // 사람이 광고 기기와 보드 사이를 지나면 그 링크의 RSSI 가 변한다. 기기마다
 // 기준선을 따로 두고 편차를 본다 — 기기마다 거리·경로가 달라 절대값은 의미가 없다.
-static void ble_cb(esp_gap_ble_cb_event_t ev, esp_ble_gap_cb_param_t *p)
+// 광고 하나를 반영한다. 호출자는 BLEScan 콜백이다 — 원시 esp_ble_gap_* 경로는
+// BLEDevice::init() 이 콜백을 덮어 GATT 업로드와 공존하지 못한다.
+void ble_note(const uint8_t *bda, int8_t rssi)
 {
-    if (ev != ESP_GAP_BLE_SCAN_RESULT_EVT) return;
-    if (p->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) return;
     ble_pkt++;
 
     int idx = -1;
     for (int i = 0; i < n_ble; i++)
-        if (!memcmp(ble_dev[i].addr, p->scan_rst.bda, 6)) { idx = i; break; }
+        if (!memcmp(ble_dev[i].addr, bda, 6)) { idx = i; break; }
     if (idx < 0) {
         if (n_ble >= BLE_MAX_DEV) return;
         idx = n_ble++;
-        memcpy(ble_dev[idx].addr, p->scan_rst.bda, 6);
-        ble_dev[idx].mu = p->scan_rst.rssi;
+        memcpy(ble_dev[idx].addr, bda, 6);
+        ble_dev[idx].mu = rssi;
         ble_dev[idx].sd = 2.0f;
         ble_dev[idx].n = 1;
-        ble_dev[idx].last = p->scan_rst.rssi;
+        ble_dev[idx].last = rssi;
         return;
     }
     ble_dev_t *d = &ble_dev[idx];
-    const float r = p->scan_rst.rssi;
+    const float r = rssi;
     d->last = r;
     d->n++;
     // 지수 이동 평균/편차. 기준선이 천천히 따라가되 급변은 편차로 드러난다.
@@ -389,7 +440,10 @@ static void keys_poll()
         else if (d && down[k] && !longed[k] && millis() - t_down[k] > 700) {
             longed[k] = true;
             if (k == 0) reset_baseline();
-            else if (k == 4) print_stats();
+            else if (k == 3) {
+                ch_lock = !ch_lock;
+                Serial.printf("[key] 채널 %s\n", ch_lock ? "고정" : "순환");
+            } else if (k == 4) print_stats();
         } else if (!d && down[k]) {
             down[k] = false;
             if (longed[k]) continue;
@@ -407,12 +461,17 @@ static void keys_poll()
                 Serial.printf("[key] 임계값 %.1f\n", thresh);
                 break;
             case 3:
-                ch_lock = !ch_lock;
-                Serial.printf("[key] 채널 %s\n", ch_lock ? "고정" : "순환");
+                // 화면이 생긴 뒤로 가장 자주 필요한 것은 "지금 갱신해라" 다.
+                // 90초를 기다리지 않고 곧바로 네 태그를 다시 그린다.
+                esl_force = true;
+                Serial.println("[key] 화면 즉시 갱신 요청");
                 break;
             case 4:
-                n_ble = 0; ble_pkt = 0; ble_hot = 0; ble_valid = 0;
-                Serial.println("[key] BLE 표 리셋");
+                // 어느 페이지를 어느 태그에 보낼지 돌린다. 태그를 벽에 붙여둔
+                // 상태에서 내용만 바꿀 수 있어야 배치를 실험할 수 있다.
+                page_shift = (page_shift + 1) % 4;
+                esl_force = true;
+                Serial.printf("[key] 페이지 회전 %d\n", page_shift);
                 break;
             case 5:
                 print_stats();
@@ -447,6 +506,17 @@ void setup()
         Serial.println("CSI 설정 실패. 중단."); while (1) delay(1000);
     }
     esp_wifi_set_csi_rx_cb(csi_cb, nullptr);
+
+    // ── 전자종이 화면 준비. 캔버스와 페이로드는 PSRAM 으로 보낸다.
+    esl_buf = (uint8_t *)heap_caps_malloc(ESL_BYTES, MALLOC_CAP_SPIRAM);
+    cbw  = new GFXcanvas1(ESL_W, ESL_H);
+    cred = new GFXcanvas1(ESL_W, ESL_H);
+    if (!esl_buf || !cbw || !cred || !cbw->getBuffer() || !cred->getBuffer()) {
+        Serial.println("[화면] 버퍼 할당 실패 — 화면 없이 계속한다");
+        esl_buf = nullptr;
+    } else {
+        Serial.println("[화면] 캔버스 준비 (296x128 x2 평면)");
+    }
 
     // 프로브 요청의 SA 를 우리 MAC 으로 채운다. 남의 MAC 을 쓰면 커널이 거부한다.
     uint8_t mac[6] = {0};
@@ -491,25 +561,24 @@ void setup()
     esp_wifi_set_channel(WCH[0], WIFI_SECOND_CHAN_NONE);
     Serial.println("[wifi] CSI 활성화");
 
-    // ── BLE 스캔. btStart() 를 쓴다 — 직접 컨트롤러를 올리면 상태가 IDLE 로
-    //    읽히는데도 INVALID_STATE 가 돌아온다(bt_audio_probe 에서 실측).
-    if (!btStart()) {
-        Serial.println("[ble] btStart() 실패 — WiFi CSI 만으로 계속한다");
-    } else if (esp_bluedroid_init() == ESP_OK && esp_bluedroid_enable() == ESP_OK) {
-        esp_ble_gap_register_callback(ble_cb);
-        esp_ble_scan_params_t sp = {};
-        sp.scan_type          = BLE_SCAN_TYPE_PASSIVE;   // 수동 — 프로브를 쏘지 않는다
-        sp.own_addr_type      = BLE_ADDR_TYPE_PUBLIC;
-        sp.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
-        sp.scan_interval      = 0x50;                    // 50ms
-        sp.scan_window        = 0x30;                    // 30ms
-        sp.scan_duplicate     = BLE_SCAN_DUPLICATE_DISABLE;  // 중복도 받는다(RSSI 시계열)
-        esp_ble_gap_set_scan_params(&sp);
-        delay(200);
-        esp_ble_gap_start_scanning(0);                   // 무한
-        Serial.println("[ble] 수동 스캔 시작 (광고 채널 37/38/39)");
-    } else {
-        Serial.println("[ble] bluedroid 실패 — WiFi CSI 만으로 계속한다");
+    // ── BLE. 스택을 **하나로** 통일한다.
+    //
+    // multiband_sense 는 원시 esp_ble_gap_* 콜백으로 광고를 셌다. 그런데 태그에
+    // 이미지를 올리려면 GATT 클라이언트가 필요하고, BLEDevice::init() 은 자기
+    // GAP 콜백을 등록해 우리 것을 덮어버린다. 두 스택을 섞으면 한쪽이 조용히 죽는다.
+    //
+    // 그래서 센싱도 Arduino BLEScan 의 콜백으로 옮겼다. 거기서도 주소와 RSSI 가
+    // 그대로 오므로 기기별 RSSI 시계열은 똑같이 만들 수 있다.
+    BLEDevice::init("CABIN-NODE");
+    {
+        BLEScan *sc = BLEDevice::getScan();
+        sc->setAdvertisedDeviceCallbacks(new SenseCb(), true);   // 중복도 받는다
+        sc->setActiveScan(false);        // 수동 — 우리가 프로브를 쏘지 않는다
+        sc->setInterval(0x50);
+        sc->setWindow(0x30);
+        // 무한 스캔. 화면 갱신 때만 esl_scan 이 잠깐 가져간다.
+        sc->start(0, nullptr, false);
+        Serial.println("[ble] 수동 스캔 시작 (광고 채널 37/38/39, BLEScan 경로)");
     }
 
     // ── 버튼. 부팅 시 LOW 로 읽히면 배선이 의심스러워 비활성한다(K6=GPIO13 실측).
@@ -525,7 +594,7 @@ void setup()
     }
     Serial.printf("(%d/%d 사용)\n", n_ok, N_KEYS);
     Serial.println("  K1짧게=마크토글  K1길게=기준선재학습  K2=임계값−  K3=임계값+");
-    Serial.println("  K4=채널고정  K5짧게=BLE리셋 K5길게=통계  K6=통계");
+    Serial.println("  K4짧게=화면즉시갱신 K4길게=채널고정  K5짧게=페이지회전 K5길게=통계  K6=통계");
     if (!key_ok[5]) Serial.println("  ※ K6 비활성 — 통계는 K5 를 길게 누르세요");
 
     // ── LED 후보 전부 출력으로
@@ -569,6 +638,243 @@ void setup()
     Serial.printf("\n기준선 학습 중 (채널당 %d 프레임). 주변에서 움직이지 마세요.\n",
                   WARMUP_N);
     Serial.println("준비되면 K1 을 눌러 마크하고 보드 앞을 지나가세요 — 보드가 스스로 검증합니다.\n");
+}
+
+// 대역 점수 추세를 그린다. 전자종이가 가장 잘하는 일이다.
+static void draw_trend(int x0, int y0, int w, int h)
+{
+    cbw->drawFastHLine(x0, y0 + h, w, 0);        // 시간축
+    cbw->drawFastVLine(x0, y0, h, 0);            // 값축
+
+    // 눈금: 임계값 선. 점선으로 그려 데이터와 구별한다.
+    const float vmax = 6.0f;                     // 대역 점수 상한(실측 최대 3 근처)
+    const int ty = y0 + h - (int)(h * (thresh / vmax));
+    if (ty > y0 && ty < y0 + h)
+        for (int x = x0; x < x0 + w; x += 4) cbw->drawPixel(x, ty, 0);
+
+    if (!trend_n) return;
+    const int n = (trend_n < TREND_N) ? (int)trend_n : TREND_N;
+    const int step = (w - 2) / TREND_N;
+    for (int i = 0; i < n; i++) {
+        // 오래된 것이 왼쪽. 링 버퍼를 시간순으로 읽는다.
+        const int idx = (int)((trend_n - n + i) % TREND_N);
+        float v = trend[idx];
+        if (v > vmax) v = vmax;
+        const int bh = (int)(h * (v / vmax));
+        const int x = x0 + 2 + i * step;
+        // 임계 초과는 채운 막대, 아래는 얇은 막대. 흑백만으로 구별된다.
+        if (v >= thresh) {
+            for (int k = 0; k < step && k < 3; k++)
+                cbw->drawFastVLine(x + k, y0 + h - bh, bh, 0);
+        } else if (bh > 0) {
+            cbw->drawFastVLine(x, y0 + h - bh, bh, 0);
+        }
+    }
+}
+
+static void render(int slot, const EslTag &t)
+{
+    // 두 평면의 극성이 반대다. BW 는 1=흰색, RED 는 1=적색 없음.
+    // 적색 평면을 0 으로 채웠더니 화면 전체가 빨개졌다(실기 관측).
+    cbw->fillScreen(1);
+    cred->fillScreen(1);
+
+    u8g2.begin(*cbw);
+    u8g2.setFontMode(1);
+    u8g2.setForegroundColor(0);
+    u8g2.setBackgroundColor(1);
+
+    u8g2.setFont(u8g2_font_helvB14_tf);
+    u8g2.setCursor(4, 16);
+    u8g2.printf("CABIN NODE #%d", slot);
+    {
+        char nb[24];
+        snprintf(nb, sizeof nb, "%lu", (unsigned long)esl_cycle);
+        u8g2.setCursor(ESL_W - u8g2.getUTF8Width(nb) - 4, 16);
+        u8g2.print(nb);
+    }
+    cbw->drawFastHLine(0, 21, ESL_W, 0);
+
+    u8g2.setFont(u8g2_font_helvR10_tf);
+    switch (slot) {
+    case 0: {   // 추세 그래프 — 가장 가까운 태그가 가장 자주 보게 되는 화면
+        float band = 0.0f;
+        for (int i = 0; i < N_WCH; i++) if (base_ok[i] && w_dev[i] > band) band = w_dev[i];
+        if (ble_dev_score > band) band = ble_dev_score;
+        u8g2.setCursor(4, 34);
+        u8g2.printf("band %.1f / thr %.1f   %lu samples",
+                    band, thresh, (unsigned long)trend_n);
+        draw_trend(4, 40, ESL_W - 8, 66);
+        u8g2.setCursor(4, 124);
+        u8g2.printf("2.4GHz passive  |  wifi %d/%d/%d Hz  ble %d dev",
+                    (int)w_pkt[0] / 6, (int)w_pkt[1] / 6, (int)w_pkt[2] / 6, n_ble);
+        break;
+    }
+    case 1: {   // 모델 — 파이프라인이 보드에서 맞게 도는가
+        int y = 40;
+        u8g2.setCursor(4, y);
+        u8g2.printf("on-device inference   %lu ms", (unsigned long)infer_ms); y += 16;
+        u8g2.setCursor(4, y);
+        u8g2.printf("channel match  %lu/%lu = %.0f%%   (random 33%%)",
+                    (unsigned long)cls_hit, (unsigned long)cls_tot,
+                    cls_tot ? 100.0 * cls_hit / cls_tot : 0.0); y += 16;
+        for (int a = 0; a < N_WCH; a++) {
+            uint32_t r = 0;
+            for (int b = 0; b < N_WCH; b++) r += cls_cm[a][b];
+            u8g2.setCursor(4, y);
+            u8g2.printf("ch%d %4d MHz : %4lu %4lu %4lu   diag %.0f%%",
+                        a, WCH_MHZ[a], (unsigned long)cls_cm[a][0],
+                        (unsigned long)cls_cm[a][1], (unsigned long)cls_cm[a][2],
+                        r ? 100.0 * cls_cm[a][a] / r : 0.0);
+            y += 16;
+        }
+        u8g2.setCursor(4, 124);
+        u8g2.printf("window %lu frames / %lu ms   skipped %lu",
+                    (unsigned long)win_n, (unsigned long)win_span_ms,
+                    (unsigned long)win_skip);
+        break;
+    }
+    case 2: {   // 전파 이웃
+        int y = 40;
+        u8g2.setCursor(4, y);
+        u8g2.printf("WiFi ch1/6/11 pkt  %lu / %lu / %lu",
+                    (unsigned long)w_pkt[0], (unsigned long)w_pkt[1],
+                    (unsigned long)w_pkt[2]); y += 16;
+        for (int i = 0; i < N_WCH; i++) {
+            u8g2.setCursor(4, y);
+            if (ap_ok[i])
+                u8g2.printf("ch%d AP %02X:%02X:%02X:%02X:%02X:%02X  %d dBm", i,
+                            ap_mac[i][0], ap_mac[i][1], ap_mac[i][2],
+                            ap_mac[i][3], ap_mac[i][4], ap_mac[i][5], ap_rssi[i]);
+            else
+                u8g2.printf("ch%d  no AP", i);
+            y += 16;
+        }
+        u8g2.setCursor(4, y);
+        u8g2.printf("BLE  %d dev   %lu adv   hot %d", n_ble,
+                    (unsigned long)ble_pkt, (int)(ble_dev_score * n_ble / 10.0f));
+        u8g2.setCursor(4, 124);
+        u8g2.printf("probing %s  tx %lu fail %lu", probe_on ? "on" : "off",
+                    (unsigned long)probe_tx, (unsigned long)probe_fail);
+        break;
+    }
+    default: {  // 이 태그 자신 — 어느 태그가 어느 역할인지 알아야 벽에 붙일 수 있다
+        int y = 40;
+        u8g2.setCursor(4, y);  u8g2.printf("%s", t.name[0] ? t.name : "(no name)"); y += 16;
+        u8g2.setCursor(4, y);
+        u8g2.printf("%02X:%02X:%02X:%02X:%02X:%02X   %d dBm",
+                    t.addr[0], t.addr[1], t.addr[2], t.addr[3], t.addr[4], t.addr[5],
+                    t.rssi); y += 16;
+        u8g2.setCursor(4, y);
+        u8g2.printf("%s   id 0x%04X   fw 0x%04X",
+                    t.m ? t.m->model : "unknown model", t.device_id, t.firmware); y += 16;
+        u8g2.setCursor(4, y);
+        u8g2.printf("battery %.1f V   %s", t.volts,
+                    (t.m && !t.m->red) ? "BW only" : "black + red"); y += 16;
+        u8g2.setCursor(4, y);
+        u8g2.printf("uploads ok %lu  fail %lu", (unsigned long)esl_ok,
+                    (unsigned long)esl_fail);
+        break;
+    }
+    }
+
+    // ── 적색을 쓸 자격.
+    //
+    // 전자종이에서 적색의 유일한 장점은 **읽지 않아도 눈에 들어온다**는 것이다.
+    // 숫자·그래프·라벨은 가까이서 읽으므로 검정이 더 선명하고 페이로드도 절반이다.
+    // 그래서 적색을 쓸 값이 있는 것은 "안 봐도 알아야 하는 이진 상태" 하나뿐이다.
+    //
+    // 그런데 지금 그 알람(대역 점수 임계 초과)은 **실제 움직임으로 검증된 적이 없다**.
+    // 검증 안 된 감지기에 적색을 걸면 노이즈에도 빨개지고, 그러면 적색이 아무
+    // 의미가 없어진다. 그래서 **감지기가 스스로 자격을 증명해야** 적색을 쓴다:
+    // K1 로 마크한 구간과 안 한 구간의 분리도(Cohen's d)가 0.8 을 넘을 때만.
+    if (bw_only) return;
+    if (t.m && !t.m->red) return;    // BW 모델
+    if (!(m_n >= 10 && u_n >= 10)) return;   // 아직 대조군이 없다
+    {
+        const double mm = m_sum / m_n, um = u_sum / u_n;
+        const double sm = sqrt(fmax(m_sq / m_n - mm * mm, 0.0));
+        const double su = sqrt(fmax(u_sq / u_n - um * um, 0.0));
+        const double pooled = sqrt((sm * sm + su * su) / 2.0);
+        const double d = (pooled > 1e-9) ? (mm - um) / pooled : 0.0;
+        if (d < 0.8) return;         // 감지기가 아직 자격을 못 얻었다
+    }
+    u8g2.begin(*cred);
+    u8g2.setFontMode(1);
+    u8g2.setForegroundColor(0);       // 적색 평면에서는 0 이 "칠한다" 다
+    u8g2.setBackgroundColor(1);
+    float band = 0.0f;
+    for (int i = 0; i < N_WCH; i++) if (base_ok[i] && w_dev[i] > band) band = w_dev[i];
+    if (ble_dev_score > band) band = ble_dev_score;
+    if (band >= thresh) {
+        u8g2.setFont(u8g2_font_helvB14_tf);
+        u8g2.setCursor(ESL_W - 90, 16);
+        u8g2.print("MOTION");
+    }
+    cred->drawFastHLine(0, 126, ESL_W, 0);
+}
+
+// 화면 갱신. 업로드 동안만 프로미스큐어스를 내린다 — BLE GATT 전송과 WiFi
+// 스니핑을 동시에 하면 한쪽이 굶는다. 링은 유지되므로 CSI 는 몇 초만 빈다.
+static void esl_refresh(void)
+{
+    if (!cbw || !esl_buf) return;
+
+    // 스캔 소유권을 넘겨받는다.
+    //
+    // 센싱은 무한 스캔(start(0, ...))을 돌리고 있다. 그 상태에서 esl_scan 이 또
+    // start() 를 부르면 보드가 조용히 멈춘다(실측: 화면 갱신 시각에 로그가 끊겼다).
+    // 게다가 esl_scan 은 끝나면서 콜백을 nullptr 로 지우므로 센싱이 영구히 죽는다.
+    // 그래서 여기서 멈추고, 끝난 뒤 콜백과 무한 스캔을 되돌린다.
+    BLEScan *sc = BLEDevice::getScan();
+    sc->stop();
+    delay(200);
+
+    esp_wifi_set_promiscuous(false);
+    n_tags = esl_scan(tags, ESL_MAX_TAG, 6);
+    Serial.printf("\n[화면] 태그 %d대\n", n_tags);
+    for (int i = 0; i < n_tags; i++) {
+        render((i + page_shift) % 4, tags[i]);
+        const size_t len = esl_pack(tags[i], *cbw, *cred, esl_buf, bw_only);
+        uint32_t ms = 0, parts = 0;
+        const EslResult r = esl_upload(tags[i].addr, esl_buf, len, &ms, &parts);
+        if (r == ESL_OK) {
+            esl_ok++;
+            // 첫 전송은 파트 크기 협상이 20 으로 나오는 일이 있어(부팅 직후) 21초가
+            // 걸린다. 그건 코덱 비교를 오염시키므로 정상 협상만 센다.
+            // 첫 전송은 협상이 20 으로 나와 21초가 걸리는 일이 있다(부팅 직후).
+            // 그걸 섞으면 비교가 오염되므로 정상 협상만 센다.
+            if (parts <= 64) {
+                const int arm = bw_only ? 1 : 0;
+                esl_ms[arm] += ms; esl_n[arm]++; esl_parts[arm] = parts; esl_len[arm] = len;
+            }
+        } else esl_fail++;
+        Serial.printf("  #%d %-14s %s  %s  %lu파트 %lums\n", i, tags[i].name,
+                      tags[i].m ? tags[i].m->model : "?", esl_result_name(r),
+                      (unsigned long)parts, (unsigned long)ms);
+    }
+    esl_cycle++;
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(WCH[cur_wch_i], WIFI_SECOND_CHAN_NONE);
+
+    // 센싱 스캔을 되돌린다. 이걸 빠뜨리면 BLE 점수가 영원히 0 이 되는데,
+    // WiFi 쪽은 계속 도니까 "BLE 만 이상하다" 로 보여 원인을 찾기 어렵다.
+    sc->setAdvertisedDeviceCallbacks(new SenseCb(), true);
+    sc->setActiveScan(false);
+    sc->start(0, nullptr, false);
+    if (esl_n[0] && esl_n[1])
+        Serial.printf("[화면] 평균 전송: BWR %lums (%lu회, %lu바이트/%lu파트)"
+                      " | 흑백만 %lums (%lu회, %lu바이트/%lu파트)  →  %.2f배 빠름\n",
+                      (unsigned long)(esl_ms[0] / esl_n[0]), (unsigned long)esl_n[0],
+                      (unsigned long)esl_len[0], (unsigned long)esl_parts[0],
+                      (unsigned long)(esl_ms[1] / esl_n[1]), (unsigned long)esl_n[1],
+                      (unsigned long)esl_len[1], (unsigned long)esl_parts[1],
+                      (double)(esl_ms[0] / esl_n[0]) / (double)(esl_ms[1] / esl_n[1]));
+    // 매 회차 흑백/컬러를 번갈아 써서 같은 환경에서 비교한다. 한쪽만 재고
+    // 예전 숫자와 비교하면 전파 상태 변화와 구분이 안 된다.
+    bw_only = !bw_only;
+    Serial.printf("[화면] 센싱 스캔 복귀, 다음 회차는 %s\n",
+                  bw_only ? "흑백만" : "흑백+적색");
 }
 
 void loop()
@@ -676,6 +982,23 @@ void loop()
                 infer_n++;
             }
         }
+    }
+
+    // 추세를 적재한다. 1초에 한 번이므로 72표본이면 72초 창이다.
+    {
+        float b = 0.0f;
+        for (int i = 0; i < N_WCH; i++) if (base_ok[i] && w_dev[i] > b) b = w_dev[i];
+        if (ble_dev_score > b) b = ble_dev_score;
+        trend[trend_n % TREND_N] = b;
+        trend_ch[trend_n % TREND_N] = cur_wch_i;
+        trend_n++;
+    }
+
+    // 화면 갱신. 전자종이는 태그당 3.5초 걸리므로 자주 할 수 없고, 할 이유도 없다.
+    // 90초 주기면 추세 그래프가 늘 최근 72초를 보여준다.
+    static uint32_t esl_t = 0;
+    if (esl_force || (trend_n > 20 && millis() - esl_t > 90000)) {
+        esl_force = false; esl_t = millis(); esl_refresh();
     }
 
     // 60초마다 자동으로 혼동행렬을 뱉는다. 버튼을 누를 사람이 없어도
