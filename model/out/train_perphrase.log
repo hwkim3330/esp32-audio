@@ -1,0 +1,145 @@
+문장 93개 (학습 66 / 홀드아웃 27)
+보류 보이스 ['F5', 'M5']
+OOD 모드 perphrase: 학습 문장 176개 (528클립) / 평가 전용 문장 30(baseline30) + 75(새 홀드아웃)
+클래스 269개 (명령 93 + OOD 176)
+학습 클립 2112, 테스트(학습된 문장) 396, 테스트(처음 보는 문장) 162, OOD 36(baseline)+150(새 문장)
+
+인코더: 파라미터 69.4K (int8 약 68KB), 추론 1회 8.14M MAC
+장치: cuda
+
+/home/kim/esp32-audio/model/scripts/train.py:415: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:836.)
+  tl += float(loss) * len(y); tn += len(y)
+ep   1  loss 12.157  train-acc 0.000   1.5s
+ep   2  loss 11.255  train-acc 0.000   1.4s
+ep   3  loss 11.115  train-acc 0.000   1.5s
+ep   4  loss 10.967  train-acc 0.000   1.3s
+ep   5  loss 10.924  train-acc 0.000   1.4s
+ep   6  loss 10.852  train-acc 0.000   1.2s
+ep   7  loss 10.778  train-acc 0.000   1.3s
+ep   8  loss 10.741  train-acc 0.000   1.1s
+ep   9  loss 10.737  train-acc 0.000   1.0s
+ep  10  loss 10.712  train-acc 0.000   1.1s  |  학습된문장 0.157  처음보는문장 0.321  *저장
+ep  11  loss 10.650  train-acc 0.000   1.2s
+ep  12  loss 10.620  train-acc 0.000   1.2s
+ep  13  loss 10.561  train-acc 0.000   1.3s
+ep  14  loss 10.472  train-acc 0.000   1.3s
+ep  15  loss 10.365  train-acc 0.000   1.3s
+ep  16  loss 10.261  train-acc 0.000   1.4s
+ep  17  loss 10.208  train-acc 0.000   1.4s
+ep  18  loss 10.059  train-acc 0.000   1.2s
+ep  19  loss  9.901  train-acc 0.000   1.4s
+ep  20  loss  9.724  train-acc 0.000   1.2s  |  학습된문장 0.465  처음보는문장 0.599  *저장
+ep  21  loss  9.606  train-acc 0.000   1.1s
+ep  22  loss  9.333  train-acc 0.000   1.1s
+ep  23  loss  9.101  train-acc 0.000   1.1s
+ep  24  loss  8.737  train-acc 0.005   1.3s
+ep  25  loss  8.298  train-acc 0.012   1.1s
+ep  26  loss  8.037  train-acc 0.026   1.3s
+ep  27  loss  7.702  train-acc 0.042   1.3s
+ep  28  loss  7.189  train-acc 0.049   1.3s
+ep  29  loss  6.718  train-acc 0.076   1.3s
+ep  30  loss  6.290  train-acc 0.103   1.3s  |  학습된문장 0.841  처음보는문장 0.870  *저장
+ep  31  loss  6.197  train-acc 0.111   1.3s
+ep  32  loss  5.752  train-acc 0.136   1.3s
+ep  33  loss  5.533  train-acc 0.143   1.3s
+ep  34  loss  5.232  train-acc 0.178   1.3s
+ep  35  loss  5.029  train-acc 0.189   1.1s
+ep  36  loss  4.629  train-acc 0.220   1.0s
+ep  37  loss  4.401  train-acc 0.235   1.1s
+ep  38  loss  4.324  train-acc 0.260   1.1s
+ep  39  loss  4.179  train-acc 0.254   1.1s
+ep  40  loss  4.053  train-acc 0.270   1.2s  |  학습된문장 0.934  처음보는문장 0.926  *저장
+ep  41  loss  3.793  train-acc 0.277   1.3s
+ep  42  loss  3.591  train-acc 0.317   1.3s
+ep  43  loss  3.533  train-acc 0.335   1.4s
+ep  44  loss  3.356  train-acc 0.338   1.2s
+ep  45  loss  3.362  train-acc 0.335   1.2s
+ep  46  loss  3.153  train-acc 0.361   1.3s
+ep  47  loss  3.109  train-acc 0.368   1.3s
+ep  48  loss  2.890  train-acc 0.404   1.3s
+ep  49  loss  2.753  train-acc 0.404   1.2s
+ep  50  loss  2.791  train-acc 0.414   1.0s  |  학습된문장 0.942  처음보는문장 0.938  *저장
+ep  51  loss  2.685  train-acc 0.415   1.2s
+ep  52  loss  2.516  train-acc 0.450   1.3s
+ep  53  loss  2.502  train-acc 0.453   1.3s
+ep  54  loss  2.334  train-acc 0.481   1.3s
+ep  55  loss  2.262  train-acc 0.478   1.3s
+ep  56  loss  2.166  train-acc 0.503   1.3s
+ep  57  loss  2.173  train-acc 0.504   1.3s
+ep  58  loss  2.156  train-acc 0.504   1.3s
+ep  59  loss  2.091  train-acc 0.526   1.3s
+ep  60  loss  2.106  train-acc 0.514   1.1s  |  학습된문장 0.970  처음보는문장 0.963  *저장
+ep  61  loss  1.917  train-acc 0.535   1.0s
+ep  62  loss  1.940  train-acc 0.547   1.1s
+ep  63  loss  1.896  train-acc 0.556   1.1s
+ep  64  loss  1.764  train-acc 0.576   1.2s
+ep  65  loss  1.709  train-acc 0.586   1.3s
+ep  66  loss  1.725  train-acc 0.579   1.3s
+ep  67  loss  1.674  train-acc 0.593   1.3s
+ep  68  loss  1.553  train-acc 0.617   1.3s
+ep  69  loss  1.555  train-acc 0.615   1.3s
+ep  70  loss  1.532  train-acc 0.627   1.4s  |  학습된문장 0.960  처음보는문장 0.932
+ep  71  loss  1.506  train-acc 0.632   1.1s
+ep  72  loss  1.429  train-acc 0.649   1.1s
+ep  73  loss  1.343  train-acc 0.667   1.1s
+ep  74  loss  1.340  train-acc 0.649   1.1s
+ep  75  loss  1.300  train-acc 0.676   1.1s
+ep  76  loss  1.236  train-acc 0.688   1.3s
+ep  77  loss  1.271  train-acc 0.678   1.2s
+ep  78  loss  1.145  train-acc 0.708   1.3s
+ep  79  loss  1.151  train-acc 0.703   1.3s
+ep  80  loss  1.162  train-acc 0.711   1.3s  |  학습된문장 0.960  처음보는문장 0.920
+ep  81  loss  1.134  train-acc 0.705   1.2s
+ep  82  loss  1.037  train-acc 0.739   1.1s
+ep  83  loss  1.044  train-acc 0.736   1.1s
+ep  84  loss  1.060  train-acc 0.733   1.0s
+ep  85  loss  1.007  train-acc 0.730   1.1s
+ep  86  loss  1.029  train-acc 0.739   1.1s
+ep  87  loss  0.939  train-acc 0.756   1.2s
+ep  88  loss  1.026  train-acc 0.741   1.3s
+ep  89  loss  0.958  train-acc 0.755   1.2s
+ep  90  loss  0.875  train-acc 0.773   1.3s  |  학습된문장 0.970  처음보는문장 0.926
+ep  91  loss  0.856  train-acc 0.783   1.3s
+ep  92  loss  0.853  train-acc 0.773   1.4s
+ep  93  loss  0.830  train-acc 0.794   1.4s
+ep  94  loss  0.831  train-acc 0.789   1.3s
+ep  95  loss  0.838  train-acc 0.797   1.2s
+ep  96  loss  0.787  train-acc 0.804   1.2s
+ep  97  loss  0.793  train-acc 0.802   1.1s
+ep  98  loss  0.760  train-acc 0.815   1.2s
+ep  99  loss  0.759  train-acc 0.812   1.2s
+ep 100  loss  0.749  train-acc 0.818   1.3s  |  학습된문장 0.967  처음보는문장 0.938
+ep 101  loss  0.778  train-acc 0.807   1.4s
+ep 102  loss  0.775  train-acc 0.803   1.4s
+ep 103  loss  0.689  train-acc 0.838   1.3s
+ep 104  loss  0.771  train-acc 0.818   1.3s
+ep 105  loss  0.742  train-acc 0.817   1.1s
+ep 106  loss  0.751  train-acc 0.816   1.1s
+ep 107  loss  0.684  train-acc 0.829   1.2s
+ep 108  loss  0.676  train-acc 0.848   1.2s
+ep 109  loss  0.703  train-acc 0.838   1.3s
+ep 110  loss  0.664  train-acc 0.834   1.3s  |  학습된문장 0.967  처음보는문장 0.951
+ep 111  loss  0.689  train-acc 0.830   1.3s
+ep 112  loss  0.690  train-acc 0.839   1.2s
+ep 113  loss  0.666  train-acc 0.831   1.3s
+ep 114  loss  0.645  train-acc 0.843   1.3s
+ep 115  loss  0.696  train-acc 0.833   1.3s
+ep 116  loss  0.685  train-acc 0.836   1.3s
+ep 117  loss  0.627  train-acc 0.854   1.2s
+ep 118  loss  0.646  train-acc 0.849   1.2s
+ep 119  loss  0.676  train-acc 0.845   1.3s
+ep 120  loss  0.668  train-acc 0.842   1.2s  |  학습된문장 0.967  처음보는문장 0.944
+
+==================================================================
+조건            OOD 모드 perphrase (학습 OOD 문장 176개)
+파라미터        69.4K   (int8 약 68KB)
+추론 1회        8.14M MAC
+학습된 문장     0.970   (보류 보이스에서)
+처음 보는 문장  0.963   ← 재학습 없이 명령 추가가 되는지의 지표
+거부 임계값     0.688  (명령 재현율 95% 지점)
+OOD 오수락(기존 30문장)             2.8%  [n=36]   프로토타입 은행 병용   0.0%
+OOD 오수락(처음 듣는 문장)           14.7%  [n=150]   프로토타입 은행 병용  10.0%
+명령 재현율     임계값만 95.9% / 은행 병용 93.9%  ← 거부의 대가
+==================================================================
+→ model/out/encoder_perphrase.pt, model/out/report_perphrase.json

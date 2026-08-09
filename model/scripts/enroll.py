@@ -60,6 +60,14 @@ def main() -> int:
                     default=["F1", "F2", "F3", "F4", "M1", "M2", "M3", "M4"],
                     help="등록에 쓸 보이스. 평가용 보류 보이스는 제외한다.")
     ap.add_argument("--test-voices", nargs="+", default=["F5", "M5"])
+    ap.add_argument("--ood-bank", action="store_true",
+                    help="OOD 프로토타입 은행을 함께 낸다. 실측 이득이 오수락 "
+                         "15.8%%→13.1%% 인데 플래시 109KB 를 먹어서 기본은 끈다")
+    ap.add_argument("--bank-k", type=int, default=0,
+                    help="은행을 구면 k-means 로 이 행 수까지 줄인다. 0 은 그대로")
+    ap.add_argument("--ood-trained-from", default=None,
+                    help="학습에 쓴 OOD 문장 목록을 가져올 체크포인트. 조건이 다른 두 "
+                         "모델을 '같은 OOD 클립' 으로 비교할 때 지정한다. 기본은 자기 자신")
     args = ap.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -116,14 +124,53 @@ def main() -> int:
     acc = float((pred == y).mean())
     print(f"\n문장 정확도   {acc_phrase:.4f}")
 
-    # OOD 거부 임계값
-    ood = [it for it in items if it["label"] == "_ood" and it["voice"] in te_v]
+    # ── OOD 거부.
+    #
+    # 학습에 쓴 OOD 문장으로 평가하면 안 된다. 체크포인트가 어느 문장을 학습에
+    # 썼는지 들고 있으므로(ood_train_texts) 그건 평가에서 빼고, 대신 그 문장들로
+    # "OOD 프로토타입 은행" 을 만든다 — 명령 프로토타입보다 OOD 쪽이 더 가까우면
+    # 거부한다. 임계값 하나로 자르는 것보다 강하고 플래시 비용은 행 몇 개다.
+    src = ck
+    if args.ood_trained_from:
+        src = torch.load(args.ood_trained_from, map_location="cpu", weights_only=False)
+    trained_ood = set(src.get("ood_train_texts") or [])
+    ood_eval = [it for it in items if it["label"] == "_ood"
+                and it["voice"] in te_v and it["text"] not in trained_ood]
+    ood_bank = [it for it in items if it["label"] == "_ood"
+                and it["voice"] in en_v and it["text"] in trained_ood] \
+        if args.ood_bank else []
+
+    ood_protos = np.zeros((0, ck["dim"]), np.float32)
+    if ood_bank:
+        by_text: dict[str, list] = {}
+        for it in ood_bank:
+            by_text.setdefault(it["text"], []).append(read_wav_i16(root / it["path"]))
+        ood_protos = np.stack([
+            F.normalize(embed(model, p, dev).mean(0), dim=0).numpy()
+            for p in by_text.values()])
+        if args.bank_k and args.bank_k < len(ood_protos):
+            # 문장 하나당 한 행씩 두면 플래시가 아깝다. 구면 k-means 로 줄인다 —
+            # 몇 행까지 줄여도 되는지는 eval_reject.py 로 정한다.
+            from eval_reject import spherical_kmeans
+            ood_protos = spherical_kmeans(ood_protos, args.bank_k)
+        print(f"OOD 프로토타입 {len(ood_protos)}개 "
+              f"(학습 OOD 문장 {len(by_text)}개 → {ood_protos.nbytes/1024:.1f}KB)")
+
+    # 판정식은 마진 하나다: (명령 최고 코사인) − (OOD 최고 코사인) ≥ CN_REJECT_MARGIN.
+    # 은행이 비면 두 번째 항이 0 이라 예전 절대 임계값 판정으로 축퇴한다.
+    # 임계값은 명령 재현율 95% 지점에서 잡는다 — 기제를 바꿔도 재현율이 고정되므로
+    # 오수락 숫자를 그대로 비교할 수 있다.
     far = thr = None
-    if ood:
-        eo = embed(model, [read_wav_i16(root / it["path"]) for it in ood], dev).numpy()
-        conf_ood = (eo @ protos.T).max(1)
-        thr = float(np.quantile(conf, 0.05))          # 명령 95% 통과
-        far = float((conf_ood >= thr).mean())
+    by_group: dict[str, list[int]] = {}
+    margin_cmd = conf - ((e @ ood_protos.T).max(1) if len(ood_protos) else 0.0)
+    if ood_eval:
+        eo = embed(model, [read_wav_i16(root / it["path"]) for it in ood_eval], dev).numpy()
+        margin_ood = (eo @ protos.T).max(1) - (
+            (eo @ ood_protos.T).max(1) if len(ood_protos) else 0.0)
+        thr = float(np.quantile(margin_cmd, 0.05))
+        far = float((margin_ood >= thr).mean())
+        for i, it in enumerate(ood_eval):
+            by_group.setdefault(it.get("group", "unknown"), []).append(i)
 
     cm = np.zeros((len(intent_ids), len(intent_ids)), int)
     for t, p in zip(y, pred):
@@ -132,8 +179,11 @@ def main() -> int:
     print(f"\n인텐트 정확도 (보류 보이스 {sorted(te_v)}): {acc:.4f}  "
           f"({int((pred==y).sum())}/{len(y)})")
     if thr is not None:
-        print(f"거부 임계값 {thr:.3f} → OOD 오수락 {far*100:.1f}% "
-              f"(명령 재현율 95%)")
+        print(f"거부 마진 임계값 {thr:.3f} (OOD 프로토타입 {len(ood_protos)}개) "
+              f"→ 오수락 {far*100:.1f}%  (명령 재현율 95%, 평가 클립 {len(ood_eval)}개)")
+        for g, idx in sorted(by_group.items()):
+            print(f"  그룹 {g:14s} 오수락 "
+                  f"{float((margin_ood[idx] >= thr).mean())*100:5.1f}%  [n={len(idx)}]")
 
     # 가장 헷갈리는 쌍 — 문구를 바꿔 해결할 후보
     pairs = [(cm[i, j], intent_ids[i], intent_ids[j])
@@ -160,8 +210,8 @@ def main() -> int:
          "// 런타임에는 태블릿이 같은 계산을 해서 PSRAM 쪽 배열로 보내줄 수 있다.",
          "#pragma once", "#include <stdint.h>", "",
          f"#define CN_N_PROTO   {len(phrases)}",
-         f"#define CN_REJECT_THR {thr if thr is not None else 0.5:.4f}f"
-         "   // 이 값 미만이면 '모르는 말' 로 처리한다", "",
+         f"#define CN_REJECT_MARGIN {thr if thr is not None else 0.5:.4f}f"
+         "   // (명령 최고 코사인 − OOD 최고 코사인) 이 값 미만이면 버린다", "",
          c_float_array("cn_protos", protos),
          "// 프로토타입 행 → 인텐트 인덱스",
          "static const uint8_t cn_proto_intent[CN_N_PROTO] = {"
@@ -169,14 +219,25 @@ def main() -> int:
          "// 프로토타입 행 → 원문(디버깅·태블릿 표시용)",
          "static const char *const cn_proto_text[CN_N_PROTO] = {",
          *[f'  "{t}",' for t, _ in phrases],
-         "};\n"]
+         "};\n",
+         "// ── 거부용 OOD 프로토타입. 명령이 아닌 말들의 중심이다.",
+         "// 판정: 명령 최고점이 CN_REJECT_THR 미만이거나, OOD 최고점보다 낮으면 거부.",
+         "// 임계값 하나로만 자르면 오수락이 안 잡혀서(측정) 이 은행을 같이 쓴다.",
+         f"#define CN_N_OOD_PROTO {len(ood_protos)}",
+         (c_float_array("cn_ood_protos", ood_protos) if len(ood_protos)
+          else "static const float cn_ood_protos[1] = {0.0f};  // 비어 있음\n")]
     (outdir / "prototypes.h").write_text("\n".join(h), encoding="utf-8")
     print(f"\nprototypes.h: {(outdir/'prototypes.h').stat().st_size/1024:.1f}KB "
           f"({len(intent_ids)}x{ck['dim']} float = {protos.nbytes/1024:.1f}KB 플래시)")
 
     Path(args.report).write_text(json.dumps({
-        "intent_accuracy": acc, "n_test": int(len(y)),
-        "reject_threshold": thr, "ood_false_accept": far,
+        "intent_accuracy": acc, "phrase_accuracy": acc_phrase, "n_test": int(len(y)),
+        "reject_margin": thr, "ood_false_accept": far,
+        "n_ood_eval": len(ood_eval), "n_ood_protos": int(len(ood_protos)),
+        "ood_false_accept_by_group": {
+            g: float((margin_ood[idx] >= thr).mean()) for g, idx in by_group.items()
+        } if thr is not None else None,
+        "ood_mode": ck.get("ood_mode", "exclude"),
         "enroll_voices": sorted(en_v), "test_voices": sorted(te_v),
         "confusion_top": [{"n": int(n), "true": a, "pred": b}
                           for n, a, b in pairs[:20]],

@@ -1,0 +1,230 @@
+{
+ "encoder_exclude": {
+  "mode": "exclude",
+  "n_cmd_proto": 93,
+  "rules": {
+   "thr_only": {
+    "threshold": 0.6871278882026672,
+    "far": 0.3387096774193548,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9371218252591822,
+    "bank_rows": 0,
+    "bank_flash_kb": 0.0,
+    "far_by_group": {
+     "baseline30": 0.19444444444444445,
+     "chitchat": 0.5166666666666667,
+     "hard_negative": 0.3194444444444444,
+     "short": 0.1111111111111111
+    }
+   },
+   "margin_bank176": {
+    "threshold": 0.01593712531030178,
+    "far": 0.03763440860215054,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.99183913361853,
+    "bank_rows": 176,
+    "bank_flash_kb": 88.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.016666666666666666,
+     "hard_negative": 0.027777777777777776,
+     "short": 0.2222222222222222
+    }
+   },
+   "margin_bank32": {
+    "threshold": 0.06369893252849579,
+    "far": 0.053763440860215055,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9873203067792038,
+    "bank_rows": 32,
+    "bank_flash_kb": 16.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.016666666666666666,
+     "hard_negative": 0.013888888888888888,
+     "short": 0.4444444444444444
+    }
+   },
+   "margin_bank16": {
+    "threshold": 0.09347012639045715,
+    "far": 0.11290322580645161,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9772131652984931,
+    "bank_rows": 16,
+    "bank_flash_kb": 8.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.05,
+     "hard_negative": 0.027777777777777776,
+     "short": 0.8888888888888888
+    }
+   },
+   "margin_bank8": {
+    "threshold": 0.10735951364040375,
+    "far": 0.08602150537634409,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9781477627471384,
+    "bank_rows": 8,
+    "bank_flash_kb": 4.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.06666666666666667,
+     "hard_negative": 0.027777777777777776,
+     "short": 0.5555555555555556
+    }
+   }
+  }
+ },
+ "encoder_single": {
+  "mode": "single",
+  "n_cmd_proto": 93,
+  "rules": {
+   "thr_only": {
+    "threshold": 0.6727544665336609,
+    "far": 0.46236559139784944,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9121671098778279,
+    "bank_rows": 0,
+    "bank_flash_kb": 0.0,
+    "far_by_group": {
+     "baseline30": 0.3888888888888889,
+     "chitchat": 0.5166666666666667,
+     "hard_negative": 0.4861111111111111,
+     "short": 0.3333333333333333
+    }
+   },
+   "margin_bank176": {
+    "threshold": 0.016831839457154274,
+    "far": 0.05913978494623656,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9882452692026054,
+    "bank_rows": 176,
+    "bank_flash_kb": 88.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.05,
+     "hard_negative": 0.0,
+     "short": 0.4444444444444444
+    }
+   },
+   "margin_bank32": {
+    "threshold": 0.10319388657808304,
+    "far": 0.053763440860215055,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9883223494045554,
+    "bank_rows": 32,
+    "bank_flash_kb": 16.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.016666666666666666,
+     "hard_negative": 0.0,
+     "short": 0.5
+    }
+   },
+   "margin_bank16": {
+    "threshold": 0.10520605742931366,
+    "far": 0.053763440860215055,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9846803098624118,
+    "bank_rows": 16,
+    "bank_flash_kb": 8.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.03333333333333333,
+     "hard_negative": 0.0,
+     "short": 0.4444444444444444
+    }
+   },
+   "margin_bank8": {
+    "threshold": 0.14102306962013245,
+    "far": 0.06451612903225806,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.985952133194589,
+    "bank_rows": 8,
+    "bank_flash_kb": 4.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.03333333333333333,
+     "hard_negative": 0.0,
+     "short": 0.5555555555555556
+    }
+   }
+  }
+ },
+ "encoder_perphrase": {
+  "mode": "perphrase",
+  "n_cmd_proto": 93,
+  "rules": {
+   "thr_only": {
+    "threshold": 0.6961439847946167,
+    "far": 0.10215053763440861,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9847573900643619,
+    "bank_rows": 0,
+    "bank_flash_kb": 0.0,
+    "far_by_group": {
+     "baseline30": 0.027777777777777776,
+     "chitchat": 0.06666666666666667,
+     "hard_negative": 0.041666666666666664,
+     "short": 0.6111111111111112
+    }
+   },
+   "margin_bank176": {
+    "threshold": 0.020470580086112022,
+    "far": 0.11827956989247312,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9815681967086753,
+    "bank_rows": 176,
+    "bank_flash_kb": 88.0,
+    "far_by_group": {
+     "baseline30": 0.027777777777777776,
+     "chitchat": 0.11666666666666667,
+     "hard_negative": 0.041666666666666664,
+     "short": 0.6111111111111112
+    }
+   },
+   "margin_bank32": {
+    "threshold": 0.11061816662549973,
+    "far": 0.06989247311827956,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.983639727136085,
+    "bank_rows": 32,
+    "bank_flash_kb": 16.0,
+    "far_by_group": {
+     "baseline30": 0.027777777777777776,
+     "chitchat": 0.06666666666666667,
+     "hard_negative": 0.013888888888888888,
+     "short": 0.3888888888888889
+    }
+   },
+   "margin_bank16": {
+    "threshold": 0.13078764081001282,
+    "far": 0.07526881720430108,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9803252784522295,
+    "bank_rows": 16,
+    "bank_flash_kb": 8.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.05,
+     "hard_negative": 0.041666666666666664,
+     "short": 0.4444444444444444
+    }
+   },
+   "margin_bank8": {
+    "threshold": 0.15692773461341858,
+    "far": 0.13978494623655913,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9773576906771496,
+    "bank_rows": 8,
+    "bank_flash_kb": 4.0,
+    "far_by_group": {
+     "baseline30": 0.05555555555555555,
+     "chitchat": 0.1,
+     "hard_negative": 0.08333333333333333,
+     "short": 0.6666666666666666
+    }
+   }
+  }
+ }
+}

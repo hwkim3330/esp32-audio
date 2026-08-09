@@ -1,0 +1,154 @@
+{
+ "encoder_exclude2": {
+  "mode": "exclude",
+  "n_cmd_proto": 93,
+  "rules": {
+   "thr_only": {
+    "threshold": 0.6096956729888916,
+    "far": 0.6621621621621622,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.8889534695986309,
+    "bank_rows": 0,
+    "bank_flash_kb": 0.0,
+    "far_by_group": {
+     "baseline30": 0.7222222222222222,
+     "chitchat": 0.7571428571428571,
+     "hard_negative": 0.5967741935483871,
+     "short": 0.5740740740740741
+    }
+   },
+   "margin_bank218": {
+    "threshold": -0.02266579307615757,
+    "far": 0.18468468468468469,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.950854079886338,
+    "bank_rows": 218,
+    "bank_flash_kb": 109.0,
+    "far_by_group": {
+     "baseline30": 0.1111111111111111,
+     "chitchat": 0.1,
+     "hard_negative": 0.0967741935483871,
+     "short": 0.4444444444444444
+    }
+   },
+   "margin_bank64": {
+    "threshold": -0.007536059711128473,
+    "far": 0.23423423423423423,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9406664729245374,
+    "bank_rows": 64,
+    "bank_flash_kb": 32.0,
+    "far_by_group": {
+     "baseline30": 0.1111111111111111,
+     "chitchat": 0.11428571428571428,
+     "hard_negative": 0.11290322580645161,
+     "short": 0.6111111111111112
+    }
+   },
+   "margin_bank32": {
+    "threshold": 0.0280319657176733,
+    "far": 0.2072072072072072,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9428622170557655,
+    "bank_rows": 32,
+    "bank_flash_kb": 16.0,
+    "far_by_group": {
+     "baseline30": 0.05555555555555555,
+     "chitchat": 0.1,
+     "hard_negative": 0.0967741935483871,
+     "short": 0.5740740740740741
+    }
+   },
+   "margin_bank16": {
+    "threshold": 0.05879347398877144,
+    "far": 0.19369369369369369,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9375262359133327,
+    "bank_rows": 16,
+    "bank_flash_kb": 8.0,
+    "far_by_group": {
+     "baseline30": 0.05555555555555555,
+     "chitchat": 0.1,
+     "hard_negative": 0.08064516129032258,
+     "short": 0.5370370370370371
+    }
+   }
+  }
+ },
+ "encoder_perphrase2": {
+  "mode": "perphrase",
+  "n_cmd_proto": 93,
+  "rules": {
+   "thr_only": {
+    "threshold": 0.601300835609436,
+    "far": 0.15765765765765766,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9695905583002358,
+    "bank_rows": 0,
+    "bank_flash_kb": 0.0,
+    "far_by_group": {
+     "baseline30": 0.027777777777777776,
+     "chitchat": 0.12857142857142856,
+     "hard_negative": 0.03225806451612903,
+     "short": 0.42592592592592593
+    }
+   },
+   "margin_bank218": {
+    "threshold": 0.02413192018866539,
+    "far": 0.13063063063063063,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9677580806613064,
+    "bank_rows": 218,
+    "bank_flash_kb": 109.0,
+    "far_by_group": {
+     "baseline30": 0.05555555555555555,
+     "chitchat": 0.07142857142857142,
+     "hard_negative": 0.04838709677419355,
+     "short": 0.35185185185185186
+    }
+   },
+   "margin_bank64": {
+    "threshold": 0.0733293667435646,
+    "far": 0.17567567567567569,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9642465045690852,
+    "bank_rows": 64,
+    "bank_flash_kb": 32.0,
+    "far_by_group": {
+     "baseline30": 0.1111111111111111,
+     "chitchat": 0.08571428571428572,
+     "hard_negative": 0.06451612903225806,
+     "short": 0.46296296296296297
+    }
+   },
+   "margin_bank32": {
+    "threshold": 0.11723887175321579,
+    "far": 0.16216216216216217,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9602021376214924,
+    "bank_rows": 32,
+    "bank_flash_kb": 16.0,
+    "far_by_group": {
+     "baseline30": 0.027777777777777776,
+     "chitchat": 0.05714285714285714,
+     "hard_negative": 0.0967741935483871,
+     "short": 0.46296296296296297
+    }
+   },
+   "margin_bank16": {
+    "threshold": 0.14581651985645294,
+    "far": 0.21621621621621623,
+    "cmd_recall": 0.9498207885304659,
+    "auroc": 0.9480690367787142,
+    "bank_rows": 16,
+    "bank_flash_kb": 8.0,
+    "far_by_group": {
+     "baseline30": 0.027777777777777776,
+     "chitchat": 0.08571428571428572,
+     "hard_negative": 0.12903225806451613,
+     "short": 0.6111111111111112
+    }
+   }
+  }
+ }
+}

@@ -249,12 +249,30 @@ static void brain_task(void *)
         float score = 0.0f;
         const int row = cn_match(emb, cn_protos, CN_N_PROTO, &score);
 
-        Serial.printf("[brain] mel %lums  추론 %lums  → \"%s\" (%.3f) dir=%+d(%.2f)\n",
-                      (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
-                      row >= 0 ? cn_proto_text[row] : "?", score, dir, doa_conf);
+        // 거부는 "명령에 얼마나 가까운가" 가 아니라 "명령이 명령 아닌 말보다 얼마나
+        // 더 가까운가" 로 판정한다.
+        //
+        // 절대 점수 하나로 자르면 명령 아닌 말이 그대로 통과한다 — 실측 오수락
+        // 33.9% (명령 재현율 95% 지점). cn_ood_protos 는 명령 아닌 말들의 중심이고,
+        // 그쪽과의 차(마진)로 자르면 같은 재현율에서 3.8% 가 된다. 비용은 코사인
+        // 몇 줄과 플래시 몇 KB 뿐이다.
+        //
+        // 은행이 비어 있으면(CN_N_OOD_PROTO == 0) ood_score 가 0 이라 마진이 곧
+        // 절대 점수가 되고, 예전 임계값 판정과 정확히 같아진다.
+        float ood_score = 0.0f;
+#if CN_N_OOD_PROTO > 0
+        cn_match(emb, cn_ood_protos, CN_N_OOD_PROTO, &ood_score);
+#endif
+        const float margin = score - ood_score;
 
-        if (score < CN_REJECT_THR) {
-            Serial.println("[brain] 임계값 미달 — 모르는 말로 처리");
+        Serial.printf("[brain] mel %lums  추론 %lums  → \"%s\" (%.3f, ood %.3f, "
+                      "마진 %.3f) dir=%+d(%.2f)\n",
+                      (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
+                      row >= 0 ? cn_proto_text[row] : "?", score, ood_score,
+                      margin, dir, doa_conf);
+
+        if (margin < CN_REJECT_MARGIN) {
+            Serial.println("[brain] 마진 미달 — 명령 아닌 말로 처리");
             continue;
         }
 

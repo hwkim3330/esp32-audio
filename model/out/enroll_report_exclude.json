@@ -1,0 +1,163 @@
+{
+ "intent_accuracy": 0.9050179211469535,
+ "phrase_accuracy": 0.8978494623655914,
+ "n_test": 558,
+ "reject_threshold": 0.687127947807312,
+ "ood_false_accept": 0.3387096774193548,
+ "ood_false_accept_with_bank": 0.043010752688172046,
+ "cmd_recall_with_bank": 0.9283154121863799,
+ "n_ood_eval": 186,
+ "n_ood_protos": 176,
+ "ood_false_accept_by_group": {
+  "baseline30": 0.19444444444444445,
+  "hard_negative": 0.3194444444444444,
+  "chitchat": 0.5166666666666667,
+  "short": 0.1111111111111111
+ },
+ "ood_mode": "exclude",
+ "enroll_voices": [
+  "F1",
+  "F2",
+  "F3",
+  "F4",
+  "M1",
+  "M2",
+  "M3",
+  "M4"
+ ],
+ "test_voices": [
+  "F5",
+  "M5"
+ ],
+ "confusion_top": [
+  {
+   "n": 3,
+   "true": "vol_down",
+   "pred": "vol_up"
+  },
+  {
+   "n": 3,
+   "true": "temp_down",
+   "pred": "temp_up"
+  },
+  {
+   "n": 3,
+   "true": "cancel",
+   "pred": "greet"
+  },
+  {
+   "n": 2,
+   "true": "window_open",
+   "pred": "window_close"
+  },
+  {
+   "n": 2,
+   "true": "nav_reroute",
+   "pred": "autopilot_off"
+  },
+  {
+   "n": 2,
+   "true": "music_play",
+   "pred": "music_stop"
+  },
+  {
+   "n": 2,
+   "true": "music_next",
+   "pred": "music_prev"
+  },
+  {
+   "n": 2,
+   "true": "autopilot_on",
+   "pred": "autopilot_off"
+  },
+  {
+   "n": 2,
+   "true": "ac_on",
+   "pred": "ac_off"
+  },
+  {
+   "n": 1,
+   "true": "window_open",
+   "pred": "vol_down"
+  },
+  {
+   "n": 1,
+   "true": "vol_up",
+   "pred": "vol_down"
+  },
+  {
+   "n": 1,
+   "true": "vol_up",
+   "pred": "temp_up"
+  },
+  {
+   "n": 1,
+   "true": "vol_up",
+   "pred": "fan_up"
+  },
+  {
+   "n": 1,
+   "true": "vol_down",
+   "pred": "ac_off"
+  },
+  {
+   "n": 1,
+   "true": "thanks",
+   "pred": "greet"
+  },
+  {
+   "n": 1,
+   "true": "thanks",
+   "pred": "cancel"
+  },
+  {
+   "n": 1,
+   "true": "temp_down",
+   "pred": "vol_up"
+  },
+  {
+   "n": 1,
+   "true": "nav_work",
+   "pred": "nav_reroute"
+  },
+  {
+   "n": 1,
+   "true": "nav_work",
+   "pred": "ask_battery"
+  },
+  {
+   "n": 1,
+   "true": "nav_home",
+   "pred": "autopilot_off"
+  }
+ ],
+ "per_intent_recall": {
+  "ac_on": 0.9166666666666666,
+  "ac_off": 0.9444444444444444,
+  "temp_up": 1.0,
+  "temp_down": 0.8333333333333334,
+  "fan_up": 0.7777777777777778,
+  "music_play": 0.875,
+  "music_stop": 0.875,
+  "music_next": 0.7916666666666666,
+  "music_prev": 1.0,
+  "vol_up": 0.875,
+  "vol_down": 0.8333333333333334,
+  "window_open": 0.8333333333333334,
+  "window_close": 1.0,
+  "door_lock": 0.9444444444444444,
+  "nav_home": 0.9444444444444444,
+  "nav_work": 0.8888888888888888,
+  "nav_reroute": 0.8888888888888888,
+  "nav_charger": 0.8333333333333334,
+  "ask_battery": 1.0,
+  "ask_range": 1.0,
+  "ask_tire": 0.8888888888888888,
+  "autopilot_on": 0.8333333333333334,
+  "autopilot_off": 1.0,
+  "greet": 0.9166666666666666,
+  "thanks": 0.9166666666666666,
+  "joke": 1.0,
+  "cancel": 0.875
+ }
+}

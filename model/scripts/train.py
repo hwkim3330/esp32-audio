@@ -135,9 +135,8 @@ class Utterances(torch.utils.data.Dataset):
         x = aug.wave(self.pcm[i])
         m = FE.normalize(FE.logmel(x))
         m = aug.spec(m)
-        # OOD 클립은 text2id 에 없다. 라벨 -1 로 흘려보낸다 — 거부 임계값 측정에만
-        # 쓰이고 분류 대상이 아니다. (여기서 KeyError 를 내면 학습은 끝났는데
-        # 리포트 단계에서 죽는다.)
+        # text2id 에 없는 문장(평가 전용 OOD)은 라벨 -1 로 흘려보낸다.
+        # 여기서 KeyError 를 내면 학습은 다 끝났는데 리포트 단계에서 죽는다.
         return (torch.from_numpy(m.copy()),
                 self.text2id.get(self.items[i]["text"], -1))
 
@@ -266,7 +265,15 @@ def main() -> int:
     ap.add_argument("--holdout-voices", nargs="+", default=["F5", "M5"])
     ap.add_argument("--holdout-phrases", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--ood-mode", choices=["exclude", "single", "perphrase"],
+                    default="perphrase",
+                    help="OOD 를 학습 라벨에 넣는 방식. exclude 는 예전 동작(오수락 52.8%)")
+    ap.add_argument("--ood-holdout", type=float, default=0.3,
+                    help="새 OOD 문장 중 평가 전용으로 뺄 비율")
+    ap.add_argument("--tag", default="",
+                    help="산출물 접미사. 조건별 비교 실행 시 서로 덮어쓰지 않게 한다")
     args = ap.parse_args()
+    tag = args.tag or args.ood_mode
 
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
@@ -275,10 +282,34 @@ def main() -> int:
     items = man["items"]
     outd = Path(args.out); outd.mkdir(parents=True, exist_ok=True)
 
-    # 인텐트 문장만 대상 (OOD 는 거부 임계값 측정에만 쓴다)
     cmd_items = [it for it in items if it["label"] != "_ood"]
     ood_items = [it for it in items if it["label"] == "_ood"]
     texts = sorted({it["text"] for it in cmd_items})
+
+    # ── OOD 를 학습 라벨에 넣는다.
+    #
+    # 예전에는 OOD 를 학습에서 완전히 제외하고 거부 임계값 측정에만 썼다. 그러면
+    # 인코더는 "명령끼리 구분하는 법" 만 배우고, 명령 아닌 소리를 명령 근처에 두지
+    # 않을 이유가 없다. 임계값을 어떻게 잡아도 오수락 52.8% 가 안 내려간 원인이
+    # 이것이다(점수 정규화로 고치려던 시도는 실패했다 — 가설 자체가 틀렸다).
+    #
+    # 라벨은 인텐트가 아니라 "문장" 이라는 이 프로젝트의 규칙을 OOD 에도 그대로
+    # 적용한다(perphrase). OOD 전체를 한 클래스로 묶으면(single) 서로 무관한 문장을
+    # 한 점에 모으라는 상충된 목표를 주게 된다 — 어느 쪽이 나은지 측정으로 고른다.
+    #
+    # 평가 정직성: baseline30(최초 30문장)은 학습에 절대 넣지 않는다. 예전 52.8% 와
+    # 같은 집합이라 비교의 기준점이 된다. 새 OOD 문장도 --ood-holdout 만큼 떼어
+    # "처음 듣는 문장 + 처음 듣는 목소리" 로만 평가한다.
+    base_ood = sorted({it["text"] for it in ood_items
+                       if it.get("group") == "baseline30"})
+    new_ood = sorted({it["text"] for it in ood_items
+                      if it.get("group") != "baseline30"})
+    k_ho = int(round(len(new_ood) * args.ood_holdout))
+    ood_test_texts = set(rng.choice(new_ood, size=k_ho, replace=False).tolist()) \
+        if k_ho else set()
+    ood_train_texts = [t for t in new_ood if t not in ood_test_texts]
+    if args.ood_mode == "exclude":
+        ood_train_texts = []
 
     # 문장 홀드아웃: 인텐트마다 최소 1개는 학습에 남긴다.
     by_intent: dict[str, list[str]] = {}
@@ -295,10 +326,28 @@ def main() -> int:
         unseen.update(rng.choice(ph, size=k, replace=False).tolist())
 
     hv = set(args.holdout_voices)
+    # 명령 문장이 0..len(texts)-1 을 그대로 쓰게 둔다. OOD 클래스는 그 뒤에 붙여야
+    # 평가 코드(명령 프로토타입·정확도)가 조건에 따라 달라지지 않는다.
     text2id = {t: i for i, t in enumerate(texts)}
+    n_cmd_cls = len(texts)
+    if args.ood_mode == "perphrase":
+        for j, t in enumerate(ood_train_texts):
+            text2id[t] = n_cmd_cls + j
+        n_cls = n_cmd_cls + len(ood_train_texts)
+    elif args.ood_mode == "single":
+        for t in ood_train_texts:
+            text2id[t] = n_cmd_cls
+        n_cls = n_cmd_cls + (1 if ood_train_texts else 0)
+    else:
+        n_cls = n_cmd_cls
+
+    ood_train_items = [it for it in ood_items
+                       if it["voice"] not in hv and it["text"] in set(ood_train_texts)]
+    ood_test_items = [it for it in ood_items if it["voice"] in hv and (
+        it.get("group") == "baseline30" or it["text"] in ood_test_texts)]
 
     train_items = [it for it in cmd_items
-                   if it["voice"] not in hv and it["text"] not in unseen]
+                   if it["voice"] not in hv and it["text"] not in unseen] + ood_train_items
     # 테스트: 보류 보이스만. 등록(enroll)은 학습 보이스로 한다 — 실제 등록 절차와 같다.
     enroll_seen = [it for it in cmd_items
                    if it["voice"] not in hv and it["text"] not in unseen]
@@ -308,27 +357,37 @@ def main() -> int:
                      if it["voice"] not in hv and it["text"] in unseen]
     test_unseen = [it for it in cmd_items
                    if it["voice"] in hv and it["text"] in unseen]
-    test_ood = [it for it in ood_items if it["voice"] in hv]
+    test_ood = ood_test_items
+    test_ood_base = [it for it in test_ood if it.get("group") == "baseline30"]
+    test_ood_new = [it for it in test_ood if it.get("group") != "baseline30"]
 
     print(f"문장 {len(texts)}개 (학습 {len(texts)-len(unseen)} / 홀드아웃 {len(unseen)})")
     print(f"보류 보이스 {sorted(hv)}")
+    print(f"OOD 모드 {args.ood_mode}: 학습 문장 {len(ood_train_texts)}개 "
+          f"({len(ood_train_items)}클립) / 평가 전용 문장 "
+          f"{len(base_ood)}(baseline30) + {len(ood_test_texts)}(새 홀드아웃)")
+    print(f"클래스 {n_cls}개 (명령 {n_cmd_cls} + OOD {n_cls - n_cmd_cls})")
     print(f"학습 클립 {len(train_items)}, "
           f"테스트(학습된 문장) {len(test_seen)}, "
-          f"테스트(처음 보는 문장) {len(test_unseen)}, OOD {len(test_ood)}")
+          f"테스트(처음 보는 문장) {len(test_unseen)}, "
+          f"OOD {len(test_ood_base)}(baseline)+{len(test_ood_new)}(새 문장)")
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     ds_tr = Utterances(train_items, root, text2id, train=True, seed=args.seed)
     mk = lambda its: Utterances(its, root, text2id, train=False)
     ds_en_s, ds_te_s = mk(enroll_seen), mk(test_seen)
     ds_en_u, ds_te_u = mk(enroll_unseen), mk(test_unseen)
-    ds_ood = mk(test_ood) if test_ood else None
+    ds_ood_b = mk(test_ood_base) if test_ood_base else None
+    ds_ood_n = mk(test_ood_new) if test_ood_new else None
+    # OOD 프로토타입 은행용 — 학습에 쓴 OOD 문장을 학습 보이스로 등록한다.
+    ds_ood_en = mk(ood_train_items) if ood_train_items else None
 
     dl = torch.utils.data.DataLoader(
         ds_tr, batch_size=args.bs, shuffle=True, num_workers=8,
         drop_last=True, persistent_workers=True)
 
     model = Encoder(dim=args.dim, w=args.width).to(dev)
-    head = CosineHead(args.dim, len(texts)).to(dev)
+    head = CosineHead(args.dim, n_cls).to(dev)
     n_par = sum(p.numel() for p in model.parameters())
     macs = count_macs(Encoder(dim=args.dim, w=args.width))
     print(f"\n인코더: 파라미터 {n_par/1000:.1f}K (int8 약 {n_par/1024:.0f}KB), "
@@ -340,6 +399,7 @@ def main() -> int:
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=args.lr, total_steps=args.epochs * len(dl), pct_start=0.25)
 
+    ckpt_path = outd / f"encoder_{tag}.pt"
     best = -1.0
     for ep in range(1, args.epochs + 1):
         model.train(); head.train()
@@ -370,19 +430,23 @@ def main() -> int:
             else:
                 acc_u, conf_u = float("nan"), None
             line += msg
+            # 모델 선택은 명령 정확도로만 한다. OOD 평가셋으로 고르면 그 숫자는
+            # 더 이상 홀드아웃이 아니게 된다.
             score = acc_u if not math.isnan(acc_u) else acc_s
             if score > best:
                 best = score
                 torch.save({"model": model.state_dict(),
                             "dim": args.dim, "width": args.width,
                             "texts": texts, "n_frames": FE.N_FRAMES,
-                            "n_mels": FE.N_MELS},
-                           outd / "encoder.pt")
+                            "n_mels": FE.N_MELS,
+                            "ood_mode": args.ood_mode,
+                            "ood_train_texts": ood_train_texts},
+                           ckpt_path)
                 line += "  *저장"
         print(line, flush=True)
 
     # ── 최종 리포트: 거부 임계값까지 함께 잡는다
-    ck = torch.load(outd / "encoder.pt", map_location=dev, weights_only=False)
+    ck = torch.load(ckpt_path, map_location=dev, weights_only=False)
     model.load_state_dict(ck["model"]); model.eval()
 
     e_s, ys = embed_all(model, ds_en_s, dev)
@@ -401,30 +465,64 @@ def main() -> int:
         acc_u, conf_u, _, _ = enroll_and_score(e_u, yu, t_u, ytu)
         report["acc_unseen_phrases"] = acc_u
 
-    if ds_ood is not None:
-        # 전체 명령으로 등록한 프로토타입에 OOD 를 넣어 유사도 분포를 본다.
+    if ds_ood_b is not None or ds_ood_n is not None:
+        # 명령 프로토타입(문장당 1개) — ESP32 가 실제로 들고 있는 것과 같다.
         e_all = torch.cat([e_s] + ([e_u] if len(ds_te_u) else []))
         y_all = torch.cat([ys] + ([yu] if len(ds_te_u) else []))
-        t_o, _ = embed_all(model, ds_ood, dev)
         labels = sorted(set(int(v) for v in y_all.tolist()))
         protos = torch.stack([
             F.normalize(e_all[y_all == c].mean(0), dim=0) for c in labels])
-        conf_ood = (t_o @ protos.t()).max(1).values
         conf_cmd = torch.cat([conf_s] + ([conf_u] if len(ds_te_u) else []))
-        # 명령 95% 를 통과시키는 임계값에서 OOD 오수락률
-        thr = float(torch.quantile(conf_cmd, 0.05))
-        far = float((conf_ood >= thr).float().mean())
-        report.update({
-            "reject_threshold": thr,
-            "ood_false_accept_at_95pct_recall": far,
-            "conf_cmd_mean": float(conf_cmd.mean()),
-            "conf_ood_mean": float(conf_ood.mean()),
-        })
+        thr = float(torch.quantile(conf_cmd, 0.05))     # 명령 95% 통과
 
-    (outd / "report.json").write_text(
+        # OOD 프로토타입 은행(선택 기제): 가장 가까운 프로토타입이 OOD 쪽이면 거부.
+        # 임계값 하나로 자르는 것보다 강할 수 있고, 플래시 비용은 행 몇 개다.
+        ood_protos = None
+        if ds_ood_en is not None:
+            e_o, y_o = embed_all(model, ds_ood_en, dev)
+            oid = sorted(set(int(v) for v in y_o.tolist()))
+            ood_protos = torch.stack([
+                F.normalize(e_o[y_o == c].mean(0), dim=0) for c in oid])
+
+        def measure(ds, name):
+            t_o, _ = embed_all(model, ds, dev)
+            sim_cmd = (t_o @ protos.t()).max(1).values
+            out = {
+                f"far_thr_{name}": float((sim_cmd >= thr).float().mean()),
+                f"conf_ood_mean_{name}": float(sim_cmd.mean()),
+                f"n_{name}": int(len(t_o)),
+            }
+            if ood_protos is not None:
+                sim_ood = (t_o @ ood_protos.t()).max(1).values
+                # 거부 = (임계값 미달) 또는 (OOD 프로토타입이 더 가깝다)
+                acc_mask = (sim_cmd >= thr) & (sim_cmd > sim_ood)
+                out[f"far_bank_{name}"] = float(acc_mask.float().mean())
+            return out
+
+        report.update({"reject_threshold": thr,
+                       "conf_cmd_mean": float(conf_cmd.mean())})
+        if ds_ood_b is not None:
+            report.update(measure(ds_ood_b, "baseline30"))
+        if ds_ood_n is not None:
+            report.update(measure(ds_ood_n, "unseen_ood"))
+
+        # OOD 프로토타입 은행이 명령까지 거부해 버리면 안 된다 — 대가를 같이 잰다.
+        if ood_protos is not None:
+            t_cmd = torch.cat([t_s] + ([t_u] if len(ds_te_u) else []))
+            sim_c = (t_cmd @ protos.t()).max(1).values
+            sim_o = (t_cmd @ ood_protos.t()).max(1).values
+            report["cmd_recall_thr"] = float((sim_c >= thr).float().mean())
+            report["cmd_recall_bank"] = float(
+                ((sim_c >= thr) & (sim_c > sim_o)).float().mean())
+
+    report["ood_mode"] = args.ood_mode
+    report["n_ood_train_texts"] = len(ood_train_texts)
+    (outd / f"report_{tag}.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
 
-    print("\n" + "=" * 62)
+    print("\n" + "=" * 66)
+    print(f"조건            OOD 모드 {args.ood_mode} "
+          f"(학습 OOD 문장 {len(ood_train_texts)}개)")
     print(f"파라미터        {n_par/1000:.1f}K   (int8 약 {n_par/1024:.0f}KB)")
     print(f"추론 1회        {macs/1e6:.2f}M MAC")
     print(f"학습된 문장     {acc_s:.3f}   (보류 보이스에서)")
@@ -433,12 +531,20 @@ def main() -> int:
               f"← 재학습 없이 명령 추가가 되는지의 지표")
     if "reject_threshold" in report:
         print(f"거부 임계값     {report['reject_threshold']:.3f}  "
-              f"→ OOD 오수락 {report['ood_false_accept_at_95pct_recall']*100:.1f}% "
-              f"(명령 재현율 95%)")
-        print(f"코사인 평균     명령 {report['conf_cmd_mean']:.3f} / "
-              f"OOD {report['conf_ood_mean']:.3f}")
-    print("=" * 62)
-    print(f"→ {outd/'encoder.pt'}, {outd/'report.json'}")
+              f"(명령 재현율 95% 지점)")
+        for name, ko in (("baseline30", "OOD 오수락(기존 30문장)"),
+                         ("unseen_ood", "OOD 오수락(처음 듣는 문장)")):
+            if f"far_thr_{name}" in report:
+                s = (f"{ko:26s} {report[f'far_thr_{name}']*100:5.1f}%  "
+                     f"[n={report[f'n_{name}']}]")
+                if f"far_bank_{name}" in report:
+                    s += f"   프로토타입 은행 병용 {report[f'far_bank_{name}']*100:5.1f}%"
+                print(s)
+        if "cmd_recall_bank" in report:
+            print(f"명령 재현율     임계값만 {report['cmd_recall_thr']*100:.1f}% / "
+                  f"은행 병용 {report['cmd_recall_bank']*100:.1f}%  ← 거부의 대가")
+    print("=" * 66)
+    print(f"→ {ckpt_path}, {outd/f'report_{tag}.json'}")
     return 0
 
 

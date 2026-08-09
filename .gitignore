@@ -4,3 +4,5 @@ model/out/_dummy.pt
 __pycache__/
 *.pyc
 model/data/phrasepack/
+model/out/encoder_*.pt
+model/data/gen_ood*.log

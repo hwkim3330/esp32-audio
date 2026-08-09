@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -24,21 +25,21 @@ SUPERTONIC_SR = 44100
 TARGET_SR = 16000
 VOICES = ["F1", "F2", "F3", "F4", "F5", "M1", "M2", "M3", "M4", "M5"]
 
-# 명령과 무관한 발화. 이걸 "기타"로 배워야 아무 말에나 반응하지 않는다.
-OOD_TEXTS = [
-    "오늘 점심 뭐 먹을까", "그 영화 봤어？", "회의는 세 시에 시작합니다",
-    "비가 올 것 같은데", "어제 잠을 못 잤어", "이번 주말에 뭐 해",
-    "커피 한 잔 마시고 싶다", "책상 위에 서류가 있어", "전화 좀 받아볼게",
-    "택배가 아직 안 왔네", "고양이가 소파에서 자고 있어", "환율이 많이 올랐다",
-    "그건 좀 어려울 것 같아요", "다음 정류장에서 내립니다", "사진 좀 찍어줄래",
-    "숙제 다 했어？", "이 옷 어때？", "은행에 가야 하는데",
-    "축구 경기 결과 봤어", "지난달보다 매출이 늘었습니다",
-    "여기 와이파이 비밀번호 뭐예요", "머리가 좀 아프네",
-    "내일 아침에 일찍 나가야 해", "그 사람 이름이 뭐였지",
-    "설명서를 먼저 읽어보세요", "생각보다 훨씬 크네요",
-    "약속 시간을 조금 늦춰도 될까요", "이번 학기 시간표 나왔어",
-    "빨래를 개어 놓았어요", "공원에서 산책하기 좋은 날씨야",
-]
+# 명령과 무관한 발화는 ood_texts.json 에 있다. 30문장으로는 거부가 안 됐다 —
+# 오수락 52.8% 의 원인이 데이터 부족이었고, 특히 명령과 어휘를 공유하는
+# "하드 네거티브" 가 아예 없었다. 목록이 길어져서 파일로 뺐다.
+OOD_TEXTS_JSON = "model/ood_texts.json"
+
+
+def load_ood_groups(path: str | Path) -> dict[str, list[str]]:
+    spec = json.loads(Path(path).read_text(encoding="utf-8"))
+    return {g: list(v) for g, v in spec["groups"].items()}
+
+
+def clip_name(text: str, voice: str, speed: float) -> str:
+    """파일명. hash() 는 프로세스마다 값이 달라져 재실행이 재현되지 않는다."""
+    d = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return f"{voice}_sp{int(speed * 100)}_{d}.wav"
 
 
 def to_16k(a: np.ndarray) -> np.ndarray:
@@ -83,50 +84,79 @@ def main() -> int:
     ap.add_argument("--speeds", type=float, nargs="+", default=[0.95, 1.05, 1.15],
                     help="합성 속도 배수. 발화 속도 다양성을 여기서 만든다")
     ap.add_argument("--voices", nargs="+", default=VOICES)
-    ap.add_argument("--ood-per-voice", type=int, default=6,
-                    help="보이스당 OOD 문장 수 (전체에서 순환 선택)")
+    ap.add_argument("--ood-texts", default=OOD_TEXTS_JSON)
+    ap.add_argument("--ood-only", action="store_true",
+                    help="명령은 건너뛰고 OOD 만 합성해 기존 manifest 에 덧붙인다")
+    ap.add_argument("--ood-train-voices", type=int, default=3,
+                    help="OOD 문장당 학습 보이스 수 (보류 보이스는 별도로 전부 붙는다)")
+    ap.add_argument("--holdout-voices", nargs="+", default=["F5", "M5"],
+                    help="train.py 의 --holdout-voices 와 같아야 한다")
+    ap.add_argument("--ood-groups", nargs="+",
+                    default=["hard_negative", "chitchat", "short"],
+                    help="합성할 OOD 그룹. baseline30 은 이미 합성돼 있고 평가 전용이라 제외")
     args = ap.parse_args()
 
     import supertonic as st
 
     spec = json.loads(Path(args.commands).read_text(encoding="utf-8"))
     intents = spec["intents"]
+    ood_groups = load_ood_groups(args.ood_texts)
 
     out = Path(args.out)
     tts = st.TTS(model="supertonic-3", model_dir=args.assets, auto_download=False)
     styles = {v: tts.get_voice_style(v) for v in args.voices}
 
-    # (label, text) 작업 목록. OOD 는 보이스마다 다른 문장을 쓰게 오프셋을 준다.
-    jobs: list[tuple[str, str, str, float]] = []
-    for it in intents:
-        for text in it["phrases"]:
-            for v in args.voices:
-                for sp in args.speeds:
-                    jobs.append((it["id"], text, v, sp))
-    for vi, v in enumerate(args.voices):
-        for k in range(args.ood_per_voice):
-            text = OOD_TEXTS[(vi * args.ood_per_voice + k) % len(OOD_TEXTS)]
-            for sp in args.speeds:
-                jobs.append(("_ood", text, v, sp))
+    # (label, text, voice, speed, group) 작업 목록
+    jobs: list[tuple[str, str, str, float, str]] = []
+    if not args.ood_only:
+        for it in intents:
+            for text in it["phrases"]:
+                for v in args.voices:
+                    for sp in args.speeds:
+                        jobs.append((it["id"], text, v, sp, "command"))
 
-    print(f"합성 대상 {len(jobs)}개 "
-          f"(인텐트 {len(intents)}개 + OOD, 보이스 {len(args.voices)}개, "
-          f"속도 {args.speeds})", flush=True)
+    # OOD 보이스 배정: 문장마다 학습 보이스 몇 개 + 보류 보이스 전부.
+    #
+    # 보류 보이스를 문장마다 반드시 붙이는 이유: 학습에서 뺀 OOD 문장을 "처음 듣는
+    # 목소리 + 처음 듣는 문장" 으로 평가해야 정직한 숫자가 나온다. 예전 배정 방식은
+    # (vi*6+k)%30 순환이라 F5/M5 에 걸린 OOD 문장이 6개뿐이었고, 그래서 52.8% 는
+    # 클립 36개(19/36) 위의 수였다 — ±16%p 짜리 지표였다.
+    hv = [v for v in args.holdout_voices if v in args.voices]
+    train_pool = [v for v in args.voices if v not in hv]
+    n_tv = max(1, min(args.ood_train_voices, len(train_pool)))
+    idx = 0
+    for group in args.ood_groups:
+        for text in ood_groups.get(group, []):
+            picked = [train_pool[(idx * n_tv + j) % len(train_pool)] for j in range(n_tv)]
+            for j, v in enumerate(picked + hv):
+                sp = args.speeds[(idx + j) % len(args.speeds)]
+                jobs.append(("_ood", text, v, sp, group))
+            idx += 1
+
+    # 이미 있는 클립은 다시 합성하지 않는다 (증분 실행).
+    man_path = out / "manifest.json"
+    existing: list[dict] = []
+    if man_path.exists():
+        existing = json.loads(man_path.read_text(encoding="utf-8"))["items"]
+    have = {(it["text"], it["voice"], round(float(it["speed"]), 3)) for it in existing}
+    jobs = [j for j in jobs if (j[1], j[2], round(j[3], 3)) not in have]
+
+    print(f"합성 대상 {len(jobs)}개 (기존 {len(existing)}개 유지, "
+          f"보이스 {len(args.voices)}개, 속도 {args.speeds})", flush=True)
 
     t_start = time.time()
     audio_sec = 0.0
-    manifest: list[dict] = []
-    for i, (label, text, voice, sp) in enumerate(jobs):
+    manifest: list[dict] = list(existing)
+    for i, (label, text, voice, sp, group) in enumerate(jobs):
         wav, _ = tts.synthesize(
             text, styles[voice], lang="ko", total_steps=args.steps, speed=sp
         )
         pcm = to_16k(wav)
         audio_sec += len(pcm) / TARGET_SR
-        name = f"{voice}_sp{int(sp * 100)}_{abs(hash(text)) % 10**8:08d}.wav"
-        rel = f"{label}/{name}"
+        rel = f"{label}/{clip_name(text, voice, sp)}"
         write_wav(out / rel, pcm)
         manifest.append({"path": rel, "label": label, "text": text,
-                         "voice": voice, "speed": sp,
+                         "voice": voice, "speed": sp, "group": group,
                          "samples": int(len(pcm))})
         if (i + 1) % 100 == 0 or i + 1 == len(jobs):
             el = time.time() - t_start
@@ -143,8 +173,9 @@ def main() -> int:
         encoding="utf-8",
     )
     el = time.time() - t_start
-    print(f"\n완료: {len(manifest)}개 클립, 음성 {audio_sec/60:.1f}분, "
-          f"소요 {el/60:.1f}분 (RTF {el/audio_sec:.3f})")
+    print(f"\n완료: 클립 {len(manifest)}개 (새로 {len(jobs)}개), "
+          f"새 음성 {audio_sec/60:.1f}분, "
+          f"소요 {el/60:.1f}분 (RTF {el/max(audio_sec, 1e-9):.3f})")
     print(f"→ {out}")
     return 0
 

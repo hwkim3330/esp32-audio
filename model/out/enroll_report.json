@@ -1,8 +1,18 @@
 {
- "intent_accuracy": 0.8924731182795699,
+ "intent_accuracy": 0.9444444444444444,
+ "phrase_accuracy": 0.9157706093189965,
  "n_test": 558,
- "reject_threshold": 0.6072771549224854,
- "ood_false_accept": 0.5277777777777778,
+ "reject_margin": 0.601300835609436,
+ "ood_false_accept": 0.15765765765765766,
+ "n_ood_eval": 222,
+ "n_ood_protos": 0,
+ "ood_false_accept_by_group": {
+  "baseline30": 0.027777777777777776,
+  "hard_negative": 0.03225806451612903,
+  "chitchat": 0.12857142857142856,
+  "short": 0.42592592592592593
+ },
+ "ood_mode": "perphrase",
  "enroll_voices": [
   "F1",
   "F2",
@@ -19,54 +29,29 @@
  ],
  "confusion_top": [
   {
-   "n": 4,
-   "true": "ac_on",
-   "pred": "ac_off"
-  },
-  {
-   "n": 3,
-   "true": "window_open",
-   "pred": "window_close"
-  },
-  {
    "n": 3,
    "true": "cancel",
    "pred": "greet"
   },
   {
-   "n": 2,
-   "true": "vol_up",
-   "pred": "joke"
+   "n": 3,
+   "true": "ac_on",
+   "pred": "ac_off"
   },
   {
    "n": 2,
-   "true": "vol_down",
-   "pred": "vol_up"
-  },
-  {
-   "n": 2,
-   "true": "vol_down",
-   "pred": "nav_work"
-  },
-  {
-   "n": 2,
-   "true": "temp_down",
-   "pred": "joke"
-  },
-  {
-   "n": 2,
-   "true": "cancel",
-   "pred": "thanks"
-  },
-  {
-   "n": 2,
-   "true": "ac_off",
-   "pred": "ac_on"
+   "true": "music_play",
+   "pred": "music_stop"
   },
   {
    "n": 1,
    "true": "window_open",
-   "pred": "ac_on"
+   "pred": "joke"
+  },
+  {
+   "n": 1,
+   "true": "window_open",
+   "pred": "fan_up"
   },
   {
    "n": 1,
@@ -75,77 +60,102 @@
   },
   {
    "n": 1,
-   "true": "vol_up",
-   "pred": "vol_down"
-  },
-  {
-   "n": 1,
-   "true": "vol_up",
-   "pred": "music_prev"
+   "true": "vol_down",
+   "pred": "vol_up"
   },
   {
    "n": 1,
    "true": "vol_down",
-   "pred": "thanks"
+   "pred": "nav_home"
+  },
+  {
+   "n": 1,
+   "true": "vol_down",
+   "pred": "joke"
+  },
+  {
+   "n": 1,
+   "true": "vol_down",
+   "pred": "autopilot_off"
   },
   {
    "n": 1,
    "true": "thanks",
-   "pred": "music_stop"
-  },
-  {
-   "n": 1,
-   "true": "thanks",
-   "pred": "fan_up"
-  },
-  {
-   "n": 1,
-   "true": "thanks",
-   "pred": "ask_battery"
+   "pred": "nav_charger"
   },
   {
    "n": 1,
    "true": "temp_up",
+   "pred": "music_prev"
+  },
+  {
+   "n": 1,
+   "true": "temp_down",
+   "pred": "joke"
+  },
+  {
+   "n": 1,
+   "true": "nav_reroute",
+   "pred": "music_next"
+  },
+  {
+   "n": 1,
+   "true": "nav_charger",
+   "pred": "fan_up"
+  },
+  {
+   "n": 1,
+   "true": "music_stop",
+   "pred": "door_lock"
+  },
+  {
+   "n": 1,
+   "true": "music_play",
    "pred": "nav_reroute"
   },
   {
    "n": 1,
-   "true": "temp_down",
-   "pred": "temp_up"
+   "true": "music_play",
+   "pred": "door_lock"
   },
   {
    "n": 1,
-   "true": "temp_down",
-   "pred": "music_stop"
+   "true": "music_next",
+   "pred": "greet"
+  },
+  {
+   "n": 1,
+   "true": "joke",
+   "pred": "autopilot_on"
   }
  ],
  "per_intent_recall": {
-  "ac_on": 0.7916666666666666,
+  "ac_on": 0.875,
   "ac_off": 0.8888888888888888,
   "temp_up": 0.9583333333333334,
-  "temp_down": 0.8333333333333334,
-  "fan_up": 0.8888888888888888,
-  "music_play": 0.9583333333333334,
-  "music_stop": 0.875,
-  "music_next": 0.9166666666666666,
+  "temp_down": 0.9583333333333334,
+  "fan_up": 1.0,
+  "music_play": 0.8333333333333334,
+  "music_stop": 0.9583333333333334,
+  "music_next": 0.9583333333333334,
   "music_prev": 1.0,
-  "vol_up": 0.8333333333333334,
-  "vol_down": 0.7916666666666666,
-  "window_open": 0.7777777777777778,
+  "vol_up": 1.0,
+  "vol_down": 0.8333333333333334,
+  "window_open": 0.8888888888888888,
   "window_close": 0.9444444444444444,
-  "door_lock": 0.7777777777777778,
-  "nav_home": 0.9444444444444444,
-  "nav_work": 0.9444444444444444,
+  "door_lock": 0.9444444444444444,
+  "nav_home": 1.0,
+  "nav_work": 1.0,
   "nav_reroute": 0.9444444444444444,
-  "nav_charger": 0.7777777777777778,
+  "nav_charger": 0.9444444444444444,
   "ask_battery": 1.0,
   "ask_range": 1.0,
-  "ask_tire": 1.0,
-  "autopilot_on": 0.7777777777777778,
+  "ask_tire": 0.9444444444444444,
+  "autopilot_on": 1.0,
   "autopilot_off": 1.0,
   "greet": 0.9166666666666666,
-  "thanks": 0.875,
+  "thanks": 0.9583333333333334,
   "joke": 0.9444444444444444,
-  "cancel": 0.7916666666666666
+  "cancel": 0.875
  }
 }
