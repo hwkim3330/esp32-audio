@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """CSI 진폭에 호흡 대역 주기성이 실제로 있는지 오프라인으로 확인한다.
 
+**반드시 `--fs-sweep` 으로 확인하고 나서 믿을 것.** 불균일 CSI 를 균일 격자로 옮기는
+순간 앨리어싱이 생기고, 그것이 관심 대역 안에 떨어질 수 있다. 실제로 그렇게 속았다:
+RuView 밤샘 녹음에서 10Hz 리샘플만 14.0bpm·일관성 100%·뾰족함 31.6 을 냈고, 원
+표본율(19.5Hz)이나 다른 어떤 표본율에서도 없었다. 원인은 9.767Hz 시스템 주기가
+|9.767 − 10| = 0.2333Hz = 14.0bpm 으로 접힌 것이었다. 상세는 model/CSI_PIPELINE.md.
+
 왜 필요한가. 지금 우리 감지기는 "분산 비슷한 대역 점수 > 임계값" 하나다. 그런데
 전파 환경은 사람 없이도 드리프트하고, 드리프트는 분산을 올린다 — 그래서 빈 방
 기준선만으로는 오탐과 감지를 가를 수 없다. **주기성은 다르다.** 드리프트는
@@ -315,20 +321,31 @@ def main() -> int:
     ap.add_argument("--hop", type=float, default=30.0)
     ap.add_argument("--max-frames", type=int, default=40000,
                     help="RuView 파일에서 읽을 최대 프레임(0=전부)")
+    ap.add_argument("--fs-sweep", type=float, nargs="*", default=None,
+                    help="여러 표본율로 같은 측정을 반복한다. 한 표본율에서만 나오는 "
+                         "봉우리는 리샘플 앨리어싱이다 — 이 검사를 건너뛰지 말 것")
     ap.add_argument("--method", choices=["fft", "acf"], default="fft",
                     help="acf 는 펌웨어가 실제로 쓸 계산이다")
     ap.add_argument("--out", default="model/out/csi_rate_probe.json")
     args = ap.parse_args()
 
+    fs_list = args.fs_sweep if args.fs_sweep else [args.fs]
     print(f"호흡 대역 {BREATH_LO}~{BREATH_HI}Hz ({BREATH_LO*60:.0f}~{BREATH_HI*60:.0f} bpm), "
-          f"대조 대역 {CTRL_LO}~{CTRL_HI}Hz\n")
+          f"대조 대역 {CTRL_LO}~{CTRL_HI}Hz")
+    if len(fs_list) > 1:
+        print(f"표본율 스윕 {fs_list} — 한 표본율에서만 나오는 봉우리는 앨리어싱이다")
+    print()
     res = {}
     for p in args.npz:
         t, amp, grp = load_npz(Path(p))
         base = Path(p).name
         if grp is None:
-            r = run(f"{base} (우리, 빈 방)", t, amp, args.fs, args.win, args.hop,
-                    method=args.method)
+            for fsv in fs_list:
+                r = run(f"{base} @{fsv:g}Hz (우리, 빈 방)", t, amp, fsv,
+                        args.win, args.hop, method=args.method)
+                if r:
+                    res[f"{base}@{fsv:g}"] = r
+            r = None
             if r:
                 res[base] = r
         else:
@@ -336,8 +353,12 @@ def main() -> int:
             # 저주파 성분으로 들어와 호흡처럼 보인다. 라벨별로 갈라서 본다.
             for g in sorted(set(grp.tolist())):
                 m = grp == g
-                r = run(f"{base} label={g} (우리, 빈 방)", t[m], amp[m],
-                        args.fs, args.win, args.hop, method=args.method)
+                for fsv in fs_list:
+                    r = run(f"{base} label={g} @{fsv:g}Hz", t[m], amp[m],
+                            fsv, args.win, args.hop, method=args.method)
+                    if r:
+                        res[f"{base}#{g}@{fsv:g}"] = r
+                r = None
                 if r:
                     res[f"{base}#{g}"] = r
     for p in args.ruview:
@@ -345,8 +366,12 @@ def main() -> int:
         base = Path(p).name
         for nd in sorted(set(nodes.tolist())):
             m = nodes == nd
-            r = run(f"{base} node{nd} (RuView, 사람 있음)", ts[m], amp[m],
-                    args.fs, args.win, args.hop, method=args.method)
+            for fsv in fs_list:
+                r = run(f"{base} node{nd} @{fsv:g}Hz", ts[m], amp[m],
+                        fsv, args.win, args.hop, method=args.method)
+                if r:
+                    res[f"{base}#node{nd}@{fsv:g}"] = r
+            r = None
             if r:
                 res[f"{base}#node{nd}"] = r
 
