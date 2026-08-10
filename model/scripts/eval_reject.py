@@ -91,6 +91,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", nargs="+", required=True)
     ap.add_argument("--data", default="model/data/utterances")
+    ap.add_argument("--commands", default="model/commands.json",
+                    help="weak_phrases 를 읽는다. enroll.py 와 같은 문구 집합을 써야 "
+                         "두 도구가 같은 숫자를 낸다")
+    ap.add_argument("--no-weak-filter", action="store_true",
+                    help="weak_phrases 를 무시하고 전 문구로 등록한다(비교용)")
     ap.add_argument("--ood-trained-from", required=True,
                     help="평가에서 뺄 OOD 문장 목록. 조건이 다른 모델을 같은 클립으로 본다")
     ap.add_argument("--enroll-voices", nargs="+",
@@ -109,8 +114,25 @@ def main() -> int:
                              weights_only=False).get("ood_train_texts") or [])
     en_v, te_v = set(args.enroll_voices), set(args.test_voices)
 
-    cmd_enroll = [it for it in items if it["label"] != "_ood" and it["voice"] in en_v]
-    cmd_test = [it for it in items if it["label"] != "_ood" and it["voice"] in te_v]
+    # enroll.py 와 **같은 문구 집합**을 써야 한다. 예전에는 이 스크립트가
+    # commands.json 을 아예 안 봐서, 같은 체크포인트로 enroll.py 는 오수락 8.1% 를
+    # eval_reject.py 는 15.8% 를 냈다 — 판단이 두 곳에서 갈라진 것이다.
+    weak: set[str] = set()
+    if not args.no_weak_filter:
+        spec = json.loads(Path(args.commands).read_text(encoding="utf-8"))
+        weak = set(spec.get("weak_phrases") or [])
+        # 문구가 전부 빠지는 인텐트가 없어야 한다(enroll.py 와 같은 안전장치).
+        for it in spec["intents"]:
+            if not [t for t in it["phrases"] if t not in weak]:
+                weak -= set(it["phrases"])
+        if weak:
+            print(f"약한 문구 {len(weak)}개 제외 (enroll.py 와 동일)")
+
+    def is_cmd(it):
+        return it["label"] != "_ood" and it["text"] not in weak
+
+    cmd_enroll = [it for it in items if is_cmd(it) and it["voice"] in en_v]
+    cmd_test = [it for it in items if is_cmd(it) and it["voice"] in te_v]
     ood_bank_items = [it for it in items if it["label"] == "_ood"
                       and it["voice"] in en_v and it["text"] in trained]
     ood_test = [it for it in items if it["label"] == "_ood"

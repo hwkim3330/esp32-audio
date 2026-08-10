@@ -209,8 +209,10 @@ cd model/scripts && python3 train.py --epochs 120 --bs 64
 python3 enroll.py && python3 export.py
 
 # 4b) 거부 기제를 바꿀 때 — 재현율을 고정해 놓고 오수락을 비교한다
+#     enroll.py 와 같은 문구 집합(weak_phrases)을 쓰므로 두 도구의 숫자가 일치한다
 python3 eval_reject.py --ckpt ../out/encoder.pt \
-  --ood-trained-from ../out/encoder.pt --data ../data/utterances
+  --ood-trained-from ../out/encoder.pt --data ../data/utterances \
+  --commands ../commands.json
 
 # 5) C 추론이 파이썬과 같은 값을 내는지 검증
 cd ../.. && gcc -O2 -std=c99 -Ifirmware/cabin_node \
@@ -244,7 +246,7 @@ ESP32 는 단정밀도 FPU 가 있고 **SIMD 가 없다.** int8 로 내려도 do
 | 항목 | 크기 | 어디 |
 | --- | --- | --- |
 | 인코더 가중치 | 268KB | 플래시 (`model_weights.h`, 메모리 매핑되어 복사 없음) |
-| 프로토타입 93개 | 46.5KB | 플래시 (`prototypes.h`) |
+| 프로토타입 86개 | 43.0KB | 플래시 (`prototypes.h`) — 약한 문구 7개 제외 후 |
 | 활성값 핑퐁 버퍼 | 480KB | PSRAM |
 | FFT 작업 버퍼 | 4KB | PSRAM |
 | 멜 필터뱅크 | 468 계수 | 플래시 — 40×257 중 0 아닌 것만, 프레임당 MAC 을 10,280 → 468 로 줄인다 |
