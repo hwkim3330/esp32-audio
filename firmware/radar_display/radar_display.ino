@@ -166,6 +166,30 @@ static double m_sum = 0, m_sq = 0, u_sum = 0, u_sq = 0;
 static uint32_t m_n = 0, u_n = 0;
 static uint32_t m_hit = 0, u_hit = 0;      // 임계값 초과 횟수
 
+// 판정식을 한 곳에만 둔다. 이 값은 직렬 리포트·상태 페이지·장비 페이지 세 군데에서
+// 쓰이는데, 식을 복사해 두면 한쪽만 고쳐져서 화면과 로그가 서로 다른 말을 하게 된다.
+#define VERIFY_MIN_N 10
+static bool detector_d(double *d_out)
+{
+    if (!m_n || !u_n) return false;
+    const double mm = m_sum / m_n, um = u_sum / u_n;
+    const double sm = sqrt(fmax(m_sq / m_n - mm * mm, 0.0));
+    const double su = sqrt(fmax(u_sq / u_n - um * um, 0.0));
+    const double pooled = sqrt(((sm * sm) + (su * su)) / 2.0);
+    if (d_out) *d_out = pooled > 1e-9 ? (mm - um) / pooled : 0.0;
+    return true;
+}
+
+// 이 보드가 사람을 본다고 말할 자격이 있는가. 표본이 양쪽 10개씩 있고 분리도가
+// 0.8 이상일 때만이다. 이 판정은 적색 잉크뿐 아니라 **문구**도 지배한다 —
+// 검증 안 된 감지기가 "MOTION NOW" 라고 단정하면 화면이 거짓말을 하는 것이다.
+static bool detector_verified(void)
+{
+    double d = 0.0;
+    if (m_n < VERIFY_MIN_N || u_n < VERIFY_MIN_N) return false;
+    return detector_d(&d) && d >= 0.8;
+}
+
 // 키를 누르면 **누른 키 번호만큼 LED 를 깜빡인다.**
 //
 // 이게 없어서 "3번 키만 반응한다" 는 오진이 나왔다. 여섯 개 다 작동하는데 다섯 개는
@@ -202,6 +226,65 @@ static void blink_poll(void)
 // NVS 에 남기는 것은 **누적된 증거와 사람이 정한 값**뿐이다. 기준선(base_mu/sd)은
 // 일부러 안 남긴다 — 전파 환경은 시간이 지나면 바뀌므로 묵은 기준선을 되살리면
 // 부팅 직후 유령 감지가 난다. 다시 배우는 데 40프레임이면 된다.
+#define N_SCALE   4   // 페이지 수 = 시간 축 수. store_load 가 쓰므로 여기 둔다
+
+// ── 태그별 상태는 **MAC 으로** 묶는다. 스캔 순서로 묶으면 안 된다.
+//
+// BLE 광고는 확률적이다. 6초 스캔 창에서 태그 하나가 광고를 안 하면 뒤 태그들이
+// 한 칸씩 밀린다. 그러면 스캔 순서를 인덱스로 쓰는 모든 것이 다른 물리 태그에
+// 붙는다:
+//   - 벽에 붙은 네 장의 **내용이 서로 뒤바뀐다** (전자종이라 몇 분씩 그대로 남는다)
+//   - MIN_GAP_MS 가 페이지마다 2분~30분이라 갱신 주기가 뒤섞인다
+//   - 배터리 감소율(tag_v0 부터의 차)이 다른 태그 값과 비교돼 쓰레기가 된다
+//   - 갱신 횟수가 섞여서 "이 태그를 몇 번 구웠나" 를 못 센다
+// MAC 은 이 태그들이 안 바꾸는 유일한 식별자다(랜덤화하지 않는다 — 그래서 앵커로도
+// 쓴다). 페이지 배정은 NVS 에 남겨서 재부팅해도 벽의 배치가 유지된다.
+struct TagState {
+    uint8_t  addr[6];
+    bool     used;
+    uint8_t  page;            // 이 태그가 늘 보여주는 페이지 (0~3)
+    uint32_t next;            // 다음 갱신 시각
+    float    v0;              // 처음 본 전압
+    uint32_t v0_ms;
+    uint32_t refreshes;
+};
+static TagState tstate[ESL_MAX_TAG];
+static int      n_tstate = 0;
+
+static int tag_slot_find(const uint8_t addr[6])
+{
+    for (int i = 0; i < n_tstate; i++)
+        if (tstate[i].used && !memcmp(tstate[i].addr, addr, 6)) return i;
+    return -1;
+}
+
+// 페이지 배정. 처음 본 태그에는 **아직 아무도 안 가진 가장 급한 페이지**를 준다.
+// 우선순위가 페이지 번호순인 이유: 0번이 "지금 상태 + 최근 사건" 이라 태그가 한 장뿐
+// 이어도 그것만은 보여야 한다. 태그가 4대 미만이면 뒤 페이지가 안 보이는 건 맞지만,
+// 안 보이는 쪽이 덜 급한 쪽이 되게 만든다.
+static int tag_slot_get(const uint8_t addr[6])
+{
+    int i = tag_slot_find(addr);
+    if (i >= 0) return i;
+    if (n_tstate >= ESL_MAX_TAG) return -1;
+
+    bool taken[N_SCALE] = { false };
+    for (int k = 0; k < n_tstate; k++)
+        if (tstate[k].used && tstate[k].page < N_SCALE) taken[tstate[k].page] = true;
+    uint8_t page = 0;
+    for (uint8_t p = 0; p < N_SCALE; p++) if (!taken[p]) { page = p; break; }
+
+    i = n_tstate++;
+    memcpy(tstate[i].addr, addr, 6);
+    tstate[i].used = true;
+    tstate[i].page = page;
+    tstate[i].next = 0;
+    tstate[i].v0 = 0.0f;
+    tstate[i].v0_ms = 0;
+    tstate[i].refreshes = 0;
+    return i;
+}
+
 static Preferences prefs;
 static uint32_t boot_n = 0;
 
@@ -217,6 +300,30 @@ static void store_load(void)
     m_hit = prefs.getUInt("mh", 0); u_hit = prefs.getUInt("uh", 0);
     cls_hit = prefs.getUInt("ch", 0); cls_tot = prefs.getUInt("ct", 0);
     prefs.getBytes("cm", (void *)cls_cm, sizeof(cls_cm));
+
+    // MAC→페이지 배정. 이게 없으면 재부팅마다 벽의 네 장이 자리를 바꾼다.
+    // 갱신 횟수도 같이 살린다(태그 수명 관측이 부팅으로 끊기면 의미가 없다).
+    n_tstate = (int)prefs.getUInt("tn", 0);
+    if (n_tstate > ESL_MAX_TAG) n_tstate = ESL_MAX_TAG;
+    for (int i = 0; i < n_tstate; i++) {
+        char k[8];
+        snprintf(k, sizeof k, "ta%d", i);
+        if (prefs.getBytes(k, tstate[i].addr, 6) != 6) { n_tstate = i; break; }
+        snprintf(k, sizeof k, "tp%d", i);
+        tstate[i].page = (uint8_t)prefs.getUChar(k, (uint8_t)(i % N_SCALE));
+        snprintf(k, sizeof k, "tr%d", i);
+        tstate[i].refreshes = prefs.getUInt(k, 0);
+        tstate[i].used = true;
+        tstate[i].next = 0;          // 부팅 직후 한 번은 그린다
+        tstate[i].v0 = 0.0f;         // 전압 기준점은 부팅마다 다시 잡는다
+        tstate[i].v0_ms = 0;
+    }
+    if (n_tstate)
+        Serial.printf("[저장] 태그 배정 %d대 복구: ", n_tstate);
+    for (int i = 0; i < n_tstate; i++)
+        Serial.printf(":%02X→p%u%s", tstate[i].addr[5], tstate[i].page,
+                      (i + 1 == n_tstate) ? "\n" : "  ");
+
     Serial.printf("[저장] 부팅 %lu회째. 검증 표본 마크 %lu / 비마크 %lu, "
                   "채널일치 %lu/%lu, 임계 %.1f\n",
                   (unsigned long)boot_n, (unsigned long)m_n, (unsigned long)u_n,
@@ -232,6 +339,13 @@ static void store_save(const char *why)
     prefs.putUInt("mh", m_hit); prefs.putUInt("uh", u_hit);
     prefs.putUInt("ch", cls_hit); prefs.putUInt("ct", cls_tot);
     prefs.putBytes("cm", (const void *)cls_cm, sizeof(cls_cm));
+    prefs.putUInt("tn", (uint32_t)n_tstate);
+    for (int i = 0; i < n_tstate; i++) {
+        char k[8];
+        snprintf(k, sizeof k, "ta%d", i); prefs.putBytes(k, tstate[i].addr, 6);
+        snprintf(k, sizeof k, "tp%d", i); prefs.putUChar(k, tstate[i].page);
+        snprintf(k, sizeof k, "tr%d", i); prefs.putUInt(k, tstate[i].refreshes);
+    }
     Serial.printf("[저장] 기록함 (%s)\n", why);
 }
 
@@ -527,7 +641,6 @@ static void event_tick(float band)
 // 각 축은 1초 표본을 N개씩 모아 한 칸을 만든다. 평균이 아니라 **최댓값**을 쓴다 —
 // 3초 지나간 사람을 300초로 평균하면 사라진다.
 #define TREND_N   72          // 296픽셀 폭에 4픽셀씩이면 72칸이다
-#define N_SCALE   4
 static const uint16_t SCALE_SEC[N_SCALE]  = { 1, 10, 50, 300 };   // 칸당 초
 static const char    *SCALE_NAME[N_SCALE] = { "72 s", "12 min", "1 hr", "6 hr" };
 static float    trend[N_SCALE][TREND_N];
@@ -577,10 +690,7 @@ static bool        esl_force = false;      // 버튼으로 즉시 갱신
 // 갱신은 사건이 결정하고, 이건 "너무 자주는 안 된다" 만 말한다.
 // 페이지 성격에 따라 다르다: 사건 목록은 자주 바뀌어도 되고, 6시간 그래프는 아니다.
 static const uint32_t MIN_GAP_MS[N_SCALE] = { 120000, 600000, 900000, 1800000 };
-static uint32_t   tag_next[ESL_MAX_TAG];       // 태그별 다음 갱신 시각
-static float      tag_v0[ESL_MAX_TAG];         // 처음 본 전압
-static uint32_t   tag_v0_ms[ESL_MAX_TAG];      // 그때 시각
-static uint32_t   tag_refreshes[ESL_MAX_TAG];  // 지금까지 갱신 횟수
+
 
 // 이 전압 아래로는 갱신하지 않는다. 전자종이를 낮은 전압에서 구동하면 부분만
 // 바뀌어 화면이 깨지고, 셀도 더 상한다. 모델 표의 하한이 2.2V 이므로 여유를 둔다.
@@ -847,8 +957,8 @@ static void print_stats()
     const double ms = sqrt(fmax(m_sq / m_n - mm * mm, 0.0));
     const double us = sqrt(fmax(u_sq / u_n - um * um, 0.0));
     // 분리도(Cohen's d): 두 분포가 얼마나 떨어졌나. 1.0 이상이면 쓸만하다.
-    const double pooled = sqrt(((ms * ms) + (us * us)) / 2.0);
-    const double d = pooled > 1e-9 ? (mm - um) / pooled : 0.0;
+    double d = 0.0;
+    detector_d(&d);
     Serial.printf("사람 있음 (마크)  %6lu 표본  점수 %.2f ± %.2f   임계초과 %.0f%%\n",
                   (unsigned long)m_n, mm, ms, 100.0 * m_hit / m_n);
     Serial.printf("사람 없음        %6lu 표본  점수 %.2f ± %.2f   임계초과 %.0f%%\n",
@@ -1181,11 +1291,20 @@ static void render(int slot, const EslTag &t)
 
     if (page == 0) {
         // ── 지금 상태를 한 줄로 크게. 흘깃 보는 매체이므로 이게 제일 중요하다.
+        //
+        // 단, **검증 전에는 단정하지 않는다.** 이 감지기가 사람을 본다는 것은 아직
+        // 증명되지 않았고(전부 빈 방 기준선), 그 상태에서 "MOTION NOW" 를 큰 글씨로
+        // 박으면 화면이 거짓말을 한다. 적색을 검증 뒤로 미룬 것과 같은 이유다 —
+        // 다만 적색은 안 보이면 끝이고, 이 문구는 **틀린 것을 보여준다**는 점에서 더
+        // 나쁘다. 검증 전에는 "무엇을 재고 있는지"만 말하고 판단은 미룬다.
+        const bool ok = detector_verified();
         u8g2.setFont(u8g2_font_helvB14_tf);
         u8g2.setCursor(4, 42);
-        if (ev_active)
+        if (!ok) {
+            u8g2.print(ev_active ? "BAND HIGH" : "BAND LOW");
+        } else if (ev_active) {
             u8g2.print("MOTION NOW");
-        else if (ev_total) {
+        } else if (ev_total) {
             const Event &e = events[(ev_w + N_EVENT - 1) % N_EVENT];
             const uint32_t ago_s = (millis() - (e.t_start + e.dur_s * 1000UL)) / 1000;
             if (ago_s < 3600) u8g2.printf("QUIET  %lum", (unsigned long)(ago_s / 60));
@@ -1198,6 +1317,12 @@ static void render(int slot, const EslTag &t)
         u8g2.printf("events today %lu", (unsigned long)ev_total);
         u8g2.setCursor(150, 42);
         u8g2.printf("band %.1f / thr %.1f", band_score(), thresh);
+        if (!ok) {
+            // 이 한 줄이 없으면 위의 BAND HIGH/LOW 가 사람 감지처럼 읽힌다.
+            u8g2.setCursor(4, 46);
+            u8g2.printf("not human-verified yet — K1 + walk 30 s  (mark %lu/%d)",
+                        (unsigned long)m_n, VERIFY_MIN_N);
+        }
 
         // ── 최근 사건 목록. 이게 종이가 잘하는 일이다 — 기록.
         cbw->drawFastHLine(0, 48, ESL_W, 0);
@@ -1272,24 +1397,40 @@ static void render(int slot, const EslTag &t)
         u8g2.printf("BLE %d dev   anchors %d   web %s", n_ble, n_anchor,
                     web_running() ? "ON" : "off"); y += 12;
         for (int k = 0; k < n_anchor && k < 4; k++) {
+            // anchors[] 와 tags[] 는 서로 다른 목록이다. 같은 인덱스로 엮으면 앵커
+            // 옆에 남의 전압이 찍힌다(그렇게 되어 있었다). MAC 으로 찾는다.
+            float volts = 0.0f;
+            uint32_t refr = 0;
+            int own_page = -1;
+            for (int j = 0; j < n_tags; j++)
+                if (!memcmp(tags[j].addr, anchors[k].addr, 6)) { volts = tags[j].volts; break; }
+            const int s = tag_slot_find(anchors[k].addr);
+            if (s >= 0) { refr = tstate[s].refreshes; own_page = tstate[s].page; }
+
             u8g2.setCursor(4, y);
             u8g2.printf("anchor :%02X  %d dBm  sd %.1f  z %.1f  %.2fV  %lu refresh",
                         anchors[k].addr[5], anchors[k].last, anchors[k].sd, anchors[k].z,
-                        (k < ESL_MAX_TAG) ? tags[k].volts : 0.0f,
-                        (unsigned long)((k < ESL_MAX_TAG) ? tag_refreshes[k] : 0));
+                        volts, (unsigned long)refr);
+            if (own_page >= 0) {
+                char pb[8];
+                snprintf(pb, sizeof pb, "p%d", own_page);
+                u8g2.setCursor(ESL_W - u8g2.getUTF8Width(pb) - 4, y);
+                u8g2.print(pb);
+            }
             y += 10;
         }
         y += 4;
         u8g2.setCursor(4, y);
-        if (m_n < 10) u8g2.print("HUMAN DETECTION UNVERIFIED — press K1, walk 30 s");
+        if (m_n < VERIFY_MIN_N || u_n < VERIFY_MIN_N)
+            u8g2.printf("HUMAN DETECTION UNVERIFIED — press K1, walk 30 s "
+                        "(mark %lu/%d, idle %lu/%d)",
+                        (unsigned long)m_n, VERIFY_MIN_N,
+                        (unsigned long)u_n, VERIFY_MIN_N);
         else {
-            const double mm = m_sum / m_n, um = u_sum / u_n;
-            const double sm = sqrt(fmax(m_sq / m_n - mm * mm, 0.0));
-            const double su = sqrt(fmax(u_sq / u_n - um * um, 0.0));
-            const double pl = sqrt((sm * sm + su * su) / 2.0);
-            const double d = (pl > 1e-9) ? (mm - um) / pl : 0.0;
+            double d = 0.0;
+            detector_d(&d);
             u8g2.printf("verified: d = %.2f  (%s)  mark %lu / idle %lu", d,
-                        d >= 0.8 ? "detector works" : "insufficient",
+                        detector_verified() ? "detector works" : "insufficient",
                         (unsigned long)m_n, (unsigned long)u_n);
         }
     }
@@ -1371,9 +1512,9 @@ static void esl_refresh(void)
     if (!esl_forced_now && n_tags) {
         bool any_due = false;
         for (int i = 0; i < n_tags; i++) {
-            const int slot = (i + page_shift) % N_SCALE;
-            (void)slot;
-            if (!tag_next[i] || (int32_t)(millis() - tag_next[i]) >= 0) { any_due = true; break; }
+            const int s = tag_slot_find(tags[i].addr);
+            if (s < 0 || !tstate[s].next ||
+                (int32_t)(millis() - tstate[s].next) >= 0) { any_due = true; break; }
         }
         if (!any_due) return;
     }
@@ -1393,39 +1534,44 @@ static void esl_refresh(void)
     Serial.printf("\n[화면] 태그 %d대\n", n_tags);
     int n_done = 0;
     for (int i = 0; i < n_tags; i++) {
-        const int slot = (i + page_shift) % N_SCALE;
+        const int s = tag_slot_get(tags[i].addr);
+        if (s < 0) continue;                       // 표가 찼다 — 새 태그는 못 받는다
+        TagState &ts = tstate[s];
+        // 페이지 회전(K3)은 네 장이 **함께** 돌게 더한다. 태그마다 따로 밀면 두 장이
+        // 같은 페이지를 보여줄 수 있다.
+        const int slot = (ts.page + page_shift) % N_SCALE;
 
         // 배터리 감소율을 **측정한다.** 태그가 광고에 전압을 싣기 때문에 추측할
         // 필요가 없다. 처음 본 값과 지금 값의 차이를 가동 시간으로 나눈다.
         if (tags[i].have_mfg && tags[i].volts > 0.5f) {
-            if (tag_v0[i] < 0.5f) { tag_v0[i] = tags[i].volts; tag_v0_ms[i] = millis(); }
-            const uint32_t dt = millis() - tag_v0_ms[i];
-            const float dv = tag_v0[i] - tags[i].volts;
+            if (ts.v0 < 0.5f) { ts.v0 = tags[i].volts; ts.v0_ms = millis(); }
+            const uint32_t dt = millis() - ts.v0_ms;
+            const float dv = ts.v0 - tags[i].volts;
             if (dt > 600000UL && dv > 0.005f) {
                 // 남은 용량을 2.2V 까지로 보고 선형 외삽한다. 셀 방전 곡선은 선형이
                 // 아니므로 어림값이지만, "며칠" 과 "몇 달" 을 가르기에는 충분하다.
                 const float per_h = dv / (dt / 3600000.0f);
                 const float left_h = (tags[i].volts - 2.2f) / per_h;
-                Serial.printf("  #%d 전압 %.2f→%.2fV, %.1f시간 동안 -%.3fV "
+                Serial.printf("  :%02X(p%u) 전압 %.2f→%.2fV, %.1f시간 동안 -%.3fV "
                               "→ 시간당 -%.4fV, 남은 추정 %.0f시간(%.1f일), 갱신 %lu회\n",
-                              i, tag_v0[i], tags[i].volts, dt / 3600000.0f, dv,
-                              per_h, left_h, left_h / 24.0f,
-                              (unsigned long)tag_refreshes[i]);
+                              tags[i].addr[5], ts.page, ts.v0, tags[i].volts,
+                              dt / 3600000.0f, dv, per_h, left_h, left_h / 24.0f,
+                              (unsigned long)ts.refreshes);
             }
         }
 
         // 전압이 낮으면 건드리지 않는다. 낮은 전압 구동은 화면을 깨고 셀을 더 상하게 한다.
         if (tags[i].have_mfg && tags[i].volts > 0.5f && tags[i].volts < V_CUTOFF) {
-            Serial.printf("  #%d %s  %.2fV — 하한 %.2fV 미만이라 건너뛴다\n",
-                          i, tags[i].name, tags[i].volts, V_CUTOFF);
+            Serial.printf("  :%02X %s  %.2fV — 하한 %.2fV 미만이라 건너뛴다\n",
+                          tags[i].addr[5], tags[i].name, tags[i].volts, V_CUTOFF);
             continue;
         }
 
         // 자기 시간 축의 주기가 안 됐으면 건너뛴다. 강제 갱신(K4)은 예외다.
-        if (!esl_forced_now && tag_next[i] && (int32_t)(millis() - tag_next[i]) < 0)
+        if (!esl_forced_now && ts.next && (int32_t)(millis() - ts.next) < 0)
             continue;
-        tag_next[i] = millis() + MIN_GAP_MS[slot];
-        tag_refreshes[i]++;
+        ts.next = millis() + MIN_GAP_MS[slot];
+        ts.refreshes++;
         n_done++;
 
         render(slot, tags[i]);

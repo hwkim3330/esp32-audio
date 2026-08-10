@@ -135,6 +135,16 @@ esp32-audio/
 ~/.arduino15/packages/esp32/tools/esptool_py/5.0.0/esptool
 ```
 
-빌드는 `arduino-cli` + esp32 코어 3.3.0 으로 하면 된다.
-FQBN 은 이 모듈 기준 `esp32:esp32:esp32` 계열이고, PSRAM 을 쓰려면 옵션을 켜야 한다
-(정확한 옵션 문자열은 실제 빌드로 확인 필요 — 아직 안 함).
+빌드는 `arduino-cli` + esp32 코어 3.3.0 으로 한다. FQBN 옵션 문자열은 실제 빌드로
+확인했다(2026-08-10, `firmware/cabin_node` 기준):
+
+```bash
+arduino-cli compile --fqbn \
+  'esp32:esp32:esp32:PSRAM=enabled,FlashSize=4M,PartitionScheme=custom,CPUFreq=240' \
+  firmware/cabin_node
+# → Sketch uses 3,641,491 bytes / partitions.csv 의 앱 파티션 3.9MB
+```
+
+`PartitionScheme=custom` 이 스케치 폴더의 `partitions.csv` 를 집어간다. arduino-cli 가
+같이 찍는 `Maximum is 16777216` 은 커스텀 파티션에서 잘못 나오는 값이라 무시한다 —
+진짜 한도는 `partitions.csv` 다.
