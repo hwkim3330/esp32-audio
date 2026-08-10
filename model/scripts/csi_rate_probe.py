@@ -159,6 +159,81 @@ def analyse_window(seg: np.ndarray, fs: float):
     return best
 
 
+
+# ─────────────────────────────────────────── 자기상관 (펌웨어가 실제로 쓸 방식)
+
+def biquad_bandpass_sos(fs: float, lo: float, hi: float):
+    """2차 버터워스 대역통과. ESP32 에서는 biquad 두 단이면 끝난다.
+
+    이 단계를 빼면 자기상관이 통째로 실패한다(실측: 실제 데이터 0.25 대 백색잡음 널
+    0.24 — 분리 없음). 선형 추세 제거만으로는 0.1Hz **이하** 드리프트가 남고, 그
+    드리프트가 자기상관 전 구간을 지배해 호흡 주기를 덮는다. RuView 가 주기 탐색
+    앞에 biquad 를 둔 이유가 이것이다 — 값싸 보여서 건너뛰었다가 되돌아왔다.
+    """
+    from scipy.signal import butter
+    return butter(2, [lo, hi], btype="band", fs=fs, output="sos")
+
+
+def acf_rate(x: np.ndarray, fs: float, sos, lo_bpm: float = 6.0, hi_bpm: float = 30.0):
+    """대역통과 후 자기상관으로 지배 주기를 찾는다. 보드에서 돌릴 것과 같은 계산이다.
+
+    FFT 대신 이걸 쓰는 이유: 360표본에 지연 범위 하나면 백만 MAC 대이고, FFT 버퍼도
+    트위들 인자도 필요 없다. 우리 cn_infer.c 의 FFT 는 CSI 빌드에서 아예 컴파일되지
+    않으므로(CN_N_FFT 미정의) 새로 들여올 이유가 없다.
+
+    뾰족함 = 정규화 자기상관의 봉우리 값(0~1). 백색잡음은 1/sqrt(N) 근처에 머문다.
+    """
+    from scipy.signal import sosfilt
+    n = len(x)
+    x = np.asarray(x, dtype=np.float64) - float(np.mean(x))
+    x = sosfilt(sos, x)
+    # 필터 과도응답을 버린다. 안 버리면 앞머리 급변이 봉우리를 만든다.
+    skip = min(n // 4, int(fs * 5))
+    x = x[skip:]
+    n = len(x)
+    e0 = float(np.dot(x, x))
+    if n < 32 or e0 <= 0:
+        return 0.0, 0.0
+    lag_lo = int(round(fs * 60.0 / hi_bpm))     # 30bpm → 2초
+    lag_hi = int(round(fs * 60.0 / lo_bpm))     # 6bpm  → 10초
+    lag_hi = min(lag_hi, n // 2)
+    if lag_hi <= lag_lo + 2:
+        return 0.0, 0.0
+    r = np.empty(lag_hi - lag_lo + 1)
+    for k in range(lag_lo, lag_hi + 1):
+        r[k - lag_lo] = float(np.dot(x[: n - k], x[k:])) / e0
+    i = int(np.argmax(r))
+    peak = float(r[i])
+    # 경계에서 잡힌 것은 봉우리가 아니라 단조 감소의 끝일 수 있다. 국소 최대만 받는다.
+    if i == 0 or i == len(r) - 1:
+        return 0.0, 0.0
+    if not (r[i] > r[i - 1] and r[i] > r[i + 1]):
+        return 0.0, 0.0
+    return 60.0 * fs / (lag_lo + i), peak
+
+
+_SOS_CACHE = {}
+
+
+def analyse_window_acf(seg: np.ndarray, fs: float):
+    """서브캐리어마다 자기상관을 돌려 가장 뾰족한 것을 고른다."""
+    key = (fs, BREATH_LO, BREATH_HI)
+    if key not in _SOS_CACHE:
+        _SOS_CACHE[key] = biquad_bandpass_sos(fs, BREATH_LO, BREATH_HI)
+    sos = _SOS_CACHE[key]
+    best = None
+    for c in range(seg.shape[1]):
+        v = seg[:, c]
+        if np.allclose(v, v[0]):
+            continue
+        bpm, sharp = acf_rate(v, fs, sos)
+        if bpm <= 0:
+            continue
+        if best is None or sharp > best[2]:
+            best = (sharp, bpm, sharp, c)
+    return best
+
+
 def synth_control(n: int, n_ch: int, fs: float, seed: int, kind: str):
     """합성 대조군 두 종류.
 
@@ -176,7 +251,8 @@ def synth_control(n: int, n_ch: int, fs: float, seed: int, kind: str):
 
 
 def run(name: str, t: np.ndarray, amp: np.ndarray, fs: float,
-        win_s: float, hop_s: float, seed: int = 0):
+        win_s: float, hop_s: float, seed: int = 0, method: str = "fft"):
+    win_fn = analyse_window_acf if method == "acf" else analyse_window
     grid, x = resample_uniform(t, amp, fs)
     nwin = int(win_s * fs)
     nhop = int(hop_s * fs)
@@ -187,7 +263,7 @@ def run(name: str, t: np.ndarray, amp: np.ndarray, fs: float,
     def sweep(sig):
         out = []
         for st in range(0, len(sig) - nwin + 1, nhop):
-            r = analyse_window(sig[st:st + nwin], fs)
+            r = win_fn(sig[st:st + nwin], fs)
             if r:
                 out.append(r)
         return out
@@ -239,6 +315,8 @@ def main() -> int:
     ap.add_argument("--hop", type=float, default=30.0)
     ap.add_argument("--max-frames", type=int, default=40000,
                     help="RuView 파일에서 읽을 최대 프레임(0=전부)")
+    ap.add_argument("--method", choices=["fft", "acf"], default="fft",
+                    help="acf 는 펌웨어가 실제로 쓸 계산이다")
     ap.add_argument("--out", default="model/out/csi_rate_probe.json")
     args = ap.parse_args()
 
@@ -249,7 +327,8 @@ def main() -> int:
         t, amp, grp = load_npz(Path(p))
         base = Path(p).name
         if grp is None:
-            r = run(f"{base} (우리, 빈 방)", t, amp, args.fs, args.win, args.hop)
+            r = run(f"{base} (우리, 빈 방)", t, amp, args.fs, args.win, args.hop,
+                    method=args.method)
             if r:
                 res[base] = r
         else:
@@ -258,7 +337,7 @@ def main() -> int:
             for g in sorted(set(grp.tolist())):
                 m = grp == g
                 r = run(f"{base} label={g} (우리, 빈 방)", t[m], amp[m],
-                        args.fs, args.win, args.hop)
+                        args.fs, args.win, args.hop, method=args.method)
                 if r:
                     res[f"{base}#{g}"] = r
     for p in args.ruview:
@@ -267,7 +346,7 @@ def main() -> int:
         for nd in sorted(set(nodes.tolist())):
             m = nodes == nd
             r = run(f"{base} node{nd} (RuView, 사람 있음)", ts[m], amp[m],
-                    args.fs, args.win, args.hop)
+                    args.fs, args.win, args.hop, method=args.method)
             if r:
                 res[f"{base}#node{nd}"] = r
 
