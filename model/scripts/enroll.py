@@ -60,6 +60,9 @@ def main() -> int:
                     default=["F1", "F2", "F3", "F4", "M1", "M2", "M3", "M4"],
                     help="등록에 쓸 보이스. 평가용 보류 보이스는 제외한다.")
     ap.add_argument("--test-voices", nargs="+", default=["F5", "M5"])
+    ap.add_argument("--no-weak-filter", action="store_true",
+                    help="commands.json 의 weak_phrases 를 무시하고 전 문구를 등록한다 "
+                         "(비교용). 기본은 제외 — 실측 오수락 15.8%% → 10.1%%")
     ap.add_argument("--ood-bank", action="store_true",
                     help="OOD 프로토타입 은행을 함께 낸다. 실측 이득이 오수락 "
                          "15.8%%→13.1%% 인데 플래시 109KB 를 먹어서 기본은 끈다")
@@ -92,10 +95,27 @@ def main() -> int:
     # 0.93 에서 0.67 로 떨어졌다. 학습 목표와 등록 방식이 싸운 결과다.
     #
     # 그래서 문장별로 프로토타입을 만들고, 인텐트는 조회 테이블로 얻는다.
+    # ── 약한 문구는 프로토타입에서 뺀다 (commands.json 의 weak_phrases).
+    #
+    # 짧은 명령("정지", "다음 곡", "더 크게")은 짧은 추임새("그럼", "역시", "가자")와
+    # 길이도 음소 수도 비슷해서 오수락이 거기 몰린다. 문구를 빼는 것이 모델을 키우는
+    # 것보다 값싸고, 실측으로 홀드아웃 오수락 15.8% → 10.1% 에 인텐트 정확도는
+    # 오히려 올랐다(0.9444 → 0.9475). 12회 분할 전부에서 개선됐다.
+    #
+    # 학습 데이터에서는 빼지 않는다 — 인코더는 문장 단위로 학습되므로 이 문장들도
+    # 클래스로 남아 있는 것이 임베딩 공간에 이롭다. 빼는 것은 보드가 매칭하는
+    # 대상뿐이다. --no-weak-filter 로 껐다 켜며 비교할 수 있다.
+    weak = set() if args.no_weak_filter else set(spec.get("weak_phrases") or [])
     phrases: list[tuple[str, str]] = []       # (text, intent_id)
     for it in spec["intents"]:
-        for t in it["phrases"]:
+        kept = [t for t in it["phrases"] if t not in weak]
+        if not kept:                          # 인텐트가 사라지면 안 된다
+            kept = list(it["phrases"])
+            print(f"경고: {it['id']} 는 문구가 전부 weak_phrases 라 필터를 무시했다")
+        for t in kept:
             phrases.append((t, it["id"]))
+    if weak:
+        print(f"약한 문구 {len(weak)}개 제외 → 프로토타입 {len(phrases)}개")
     text2row = {t: i for i, (t, _) in enumerate(phrases)}
     proto_intent = np.array([intent_ids.index(iid) for _, iid in phrases], np.int32)
 
@@ -111,7 +131,11 @@ def main() -> int:
     print(f"  문장당 등록 클립 {min(n_used)}~{max(n_used)}개")
 
     # ── 평가: 보류 보이스. 문장 정확도와 인텐트 정확도를 따로 본다.
-    te = [it for it in items if it["voice"] in te_v and it["label"] != "_ood"]
+    # 프로토타입에서 뺀 문구는 평가에서도 뺀다. 제품에서 사라진 문구를 계속 채점하면
+    # "빼서 좋아졌다" 가 아니라 "못 맞히는 것을 안 세기로 했다" 가 된다 — 반대로 남겨
+    # 두면 사용자가 말할 수 없는 문구로 감점되므로, 빼는 쪽이 정직하다.
+    te = [it for it in items if it["voice"] in te_v and it["label"] != "_ood"
+          and it["text"] in text2row]
     pcms = [read_wav_i16(root / it["path"]) for it in te]
     y_row = np.array([text2row[it["text"]] for it in te])
     y = proto_intent[y_row]

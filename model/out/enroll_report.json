@@ -1,16 +1,16 @@
 {
- "intent_accuracy": 0.9444444444444444,
- "phrase_accuracy": 0.9157706093189965,
- "n_test": 558,
- "reject_margin": 0.601300835609436,
- "ood_false_accept": 0.15765765765765766,
+ "intent_accuracy": 0.9476744186046512,
+ "phrase_accuracy": 0.9186046511627907,
+ "n_test": 516,
+ "reject_margin": 0.6137762069702148,
+ "ood_false_accept": 0.08108108108108109,
  "n_ood_eval": 222,
  "n_ood_protos": 0,
  "ood_false_accept_by_group": {
   "baseline30": 0.027777777777777776,
-  "hard_negative": 0.03225806451612903,
-  "chitchat": 0.12857142857142856,
-  "short": 0.42592592592592593
+  "hard_negative": 0.016129032258064516,
+  "chitchat": 0.05714285714285714,
+  "short": 0.2222222222222222
  },
  "ood_mode": "perphrase",
  "enroll_voices": [
@@ -75,16 +75,6 @@
   },
   {
    "n": 1,
-   "true": "vol_down",
-   "pred": "autopilot_off"
-  },
-  {
-   "n": 1,
-   "true": "thanks",
-   "pred": "nav_charger"
-  },
-  {
-   "n": 1,
    "true": "temp_up",
    "pred": "music_prev"
   },
@@ -105,11 +95,6 @@
   },
   {
    "n": 1,
-   "true": "music_stop",
-   "pred": "door_lock"
-  },
-  {
-   "n": 1,
    "true": "music_play",
    "pred": "nav_reroute"
   },
@@ -127,23 +112,38 @@
    "n": 1,
    "true": "joke",
    "pred": "autopilot_on"
+  },
+  {
+   "n": 1,
+   "true": "greet",
+   "pred": "thanks"
+  },
+  {
+   "n": 1,
+   "true": "greet",
+   "pred": "music_next"
+  },
+  {
+   "n": 1,
+   "true": "ask_tire",
+   "pred": "joke"
   }
  ],
  "per_intent_recall": {
   "ac_on": 0.875,
   "ac_off": 0.8888888888888888,
   "temp_up": 0.9583333333333334,
-  "temp_down": 0.9583333333333334,
+  "temp_down": 0.9166666666666666,
   "fan_up": 1.0,
   "music_play": 0.8333333333333334,
-  "music_stop": 0.9583333333333334,
-  "music_next": 0.9583333333333334,
+  "music_stop": 1.0,
+  "music_next": 0.9444444444444444,
   "music_prev": 1.0,
   "vol_up": 1.0,
   "vol_down": 0.8333333333333334,
   "window_open": 0.8888888888888888,
   "window_close": 0.9444444444444444,
-  "door_lock": 0.9444444444444444,
+  "door_lock": 1.0,
   "nav_home": 1.0,
   "nav_work": 1.0,
   "nav_reroute": 0.9444444444444444,
@@ -154,7 +154,7 @@
   "autopilot_on": 1.0,
   "autopilot_off": 1.0,
   "greet": 0.9166666666666666,
-  "thanks": 0.9583333333333334,
+  "thanks": 1.0,
   "joke": 0.9444444444444444,
   "cancel": 0.875
  }
