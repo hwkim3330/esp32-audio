@@ -77,7 +77,7 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
   </section>
 
   <section>
-    <h2>Per-channel deviation (ch1 / ch6 / ch11)</h2>
+    <h2>Per-channel deviation — <span style=color:#58a6ff>ch1</span> / <span style=color:#3fb950>ch6</span> / <span style=color:#d29922>ch11</span></h2>
     <div id=chan style="height:170px"></div>
     <div class=note>band score 는 이 세 값의 최댓값이다. 널 지점 때문에 최댓값을 쓴다 —
       어떤 주파수에서 안 변해도 다른 데서 변하면 무언가 움직인 것이다.
@@ -136,10 +136,17 @@ const AX = {stroke:'#8b949e', grid:{stroke:'#21262d'}, ticks:{stroke:'#21262d'}}
 const mk = (el, opts) => {
   // 초기 데이터는 **시리즈 수만큼** 줘야 한다. [[0],[0]] 을 고정으로 주면 시리즈가
   // 3개 이상인 차트(채널별 편차)가 로드 시점에 길이 불일치로 죽는다.
+  //
+  // scales.x.time=false 가 없으면 uPlot 이 x 를 유닉스 시각으로 읽어서 축에
+  // "1/1/70 9:00am" 이 찍힌다. 우리 x 는 프레임 번호이거나 "몇 초 전" 이다.
+  //
+  // legend 는 끈다. uPlot 이 캔버스 아래 DOM 표를 붙이는데, 컨테이너 높이가 고정이라
+  // 설명 문단 위로 겹쳐 올라온다. 값은 위쪽 큰 숫자와 헤더에 이미 있다.
   const n = (opts.series||[]).length || 2;
   return new uPlot(Object.assign({
     width: el.clientWidth, height: el.clientHeight, padding:[8,8,0,0],
-    axes:[AX,AX], cursor:{y:false}, legend:{live:true},
+    axes:[AX,AX], cursor:{y:false}, legend:{show:false},
+    scales:{x:{time:false}},
   }, opts), Array.from({length:n}, ()=>[0]), el);
 };
 
@@ -157,24 +164,31 @@ let THR = 3;
 const S = (n,c) => ({label:n, stroke:c, width:1.5, spanGaps:false});
 
 const live = mk($('live'), {series:[{label:'t-'},S('band','#58a6ff')],
-  scales:{y:{range:(u,min,max)=>[0,Math.max(6,max*1.1)]}}, hooks:thrHook(()=>THR)});
+  scales:{x:{time:false},y:{range:(u,min,max)=>[0,Math.max(6,max*1.1)]}}, hooks:thrHook(()=>THR)});
 const chan = mk($('chan'), {series:[{label:'t-'},S('ch1','#58a6ff'),S('ch6','#3fb950'),
-  S('ch11','#d29922')], scales:{y:{range:(u,mn,mx)=>[0,Math.max(6,mx*1.1)]}},
+  S('ch11','#d29922')], scales:{x:{time:false},y:{range:(u,mn,mx)=>[0,Math.max(6,mx*1.1)]}},
   hooks:thrHook(()=>THR)});
 const TRN=['72 s','12 min','1 hr','6 hr'];
 const trs = TRN.map((nm,i)=>mk($('tr'+i), {series:[{label:nm},S(nm,'#58a6ff')],
-  scales:{y:{range:(u,mn,mx)=>[0,Math.max(6,mx*1.1)]}}, hooks:thrHook(()=>THR)}));
+  scales:{x:{time:false},y:{range:(u,mn,mx)=>[0,Math.max(6,mx*1.1)]}}, hooks:thrHook(()=>THR)}));
 const hist = mk($('hist'), {series:[{label:'hour'},{label:'events',stroke:'#58a6ff',
   fill:'#58a6ff55', paths:uPlot.paths.bars({size:[0.75]})}]});
-addEventListener('resize',()=>{
-  [live,chan,...trs,hist].forEach(u=>u.setSize({width:u.root.parentNode.clientWidth-20,
-    height:u.height}));
-});
 
 // ── 워터폴. 편차 z 를 색으로. 파랑(0) → 청록 → 노랑 → 빨강(8+).
 const WF=$('wf'), wfx=WF.getContext('2d'), RM=$('room'), rmx=RM.getContext('2d');
+// canvas.width 를 쓰면 캔버스가 **지워진다.** 안드로이드 크롬은 스크롤로 URL 바가
+// 숨을 때도 resize 를 쏘므로, 지운 뒤 곧바로 다시 그려야 한다. 워터폴은 초당 다섯 번
+// 갱신되니 저절로 복구되지만 방 도면은 5초 주기여서 그동안 검게 남는다(실기에서 그렇게
+// 나왔다 — 화면 회전이나 URL 바 하나로 도면이 사라진다).
 function fit(c){ c.width=c.clientWidth*devicePixelRatio; }
-[WF,RM].forEach(fit); addEventListener('resize',()=>[WF,RM].forEach(fit));
+let lastSlow=null;
+function refit(){
+  [WF,RM].forEach(fit);
+  if(lastSlow) room(lastSlow);
+  [live,chan,...trs,hist].forEach(u=>u.setSize({width:u.root.parentNode.clientWidth-20,
+    height:u.height}));
+}
+[WF,RM].forEach(fit); addEventListener('resize',refit);
 function ramp(z){
   const t=Math.max(0,Math.min(1,z/8));
   const r=Math.round(255*Math.min(1,Math.max(0,t*2-0.6)));
@@ -239,6 +253,7 @@ async function slow(){
   try{
     const s=await (await fetch('/h',{cache:'no-store'})).json();
     verified=!!s.verified;
+    lastSlow=s;   // resize 로 지워졌을 때 다시 그릴 재료
     room(s);
     s.trend.forEach((arr,i)=>{
       const sec=s.scale_sec[i], x=arr.map((_,k)=>-(arr.length-1-k)*sec);
