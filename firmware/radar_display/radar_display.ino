@@ -830,9 +830,25 @@ static void IRAM_ATTR csi_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
     float z = 0.0f; int c = 0;
-    for (int i = start; i < n; i++)
-        if (base_sd[ci][i] > 0.5f) { z += fabsf(amp[i] - base_mu[ci][i]) / base_sd[ci][i]; c++; }
+    for (int i = start; i < n; i++) {
+        if (base_sd[ci][i] > 0.5f) {
+            const float zi = fabsf(amp[i] - base_mu[ci][i]) / base_sd[ci][i];
+            z += zi; c++;
+            // 웹 워터폴은 **판정에 쓰는 값**을 그린다. 원시 진폭을 그리면 눈에 보이는
+            // 것과 점수의 출처가 달라져서, 점수가 튀는데 화면은 조용해 보일 수 있다.
+            // 여기서 채우는 이유는 프레임마다여야 하기 때문이다 — 1초에 한 번 채우면
+            // 초당 다섯 번 폴링하는 브라우저가 같은 줄을 다섯 번 그린다.
+            const int q = (int)(zi * 8.0f + 0.5f);
+            g_snap.sc_z[i] = (int8_t)(q > 127 ? 127 : q);
+        } else if (i < 128) {
+            g_snap.sc_z[i] = 0;
+        }
+    }
     w_dev[ci] = c ? (z / c) : 0.0f;
+    g_snap.w_dev[ci] = w_dev[ci];
+    g_snap.base_ok = (uint8_t)((base_ok[0] ? 1 : 0) | (base_ok[1] ? 2 : 0) |
+                               (base_ok[2] ? 4 : 0));
+    g_snap.n_sc = n_sc;
 }
 
 // ───────────────────────────────────────── BLE RSSI
@@ -1643,6 +1659,18 @@ void loop()
     const uint32_t probe_iv = (probe_mode == 1) ? 40 : 100;
     if (probe_on && millis() - probe_t >= probe_iv) { probe_t = millis(); probe_send(); }
 
+    // keys_poll 이 **호출되지 않고 있었다.** 정의만 있고 부르는 곳이 없어서 버튼 6개가
+    // 전부 죽어 있었다 — multiband_sense 와 esl_display 를 합칠 때 빠진 것으로 보인다.
+    //
+    // 증상이 조용해서 오래 안 보였다. 링커가 keys_poll 에서만 참조되는 web_start 를
+    // 통째로 버렸고(그래서 브라우저 페이지와 uPlot 이 바이너리에 아예 없었다),
+    // web_running/web_poll 은 다른 데서도 불리므로 남아 있었다. 즉 "웹 모드가 안 켜진다"
+    // 가 아니라 **켤 방법이 없었다.**
+    //
+    // 더 중요한 것은 K1 이다. 사람 감지를 확정하는 유일한 수단이 마크 버튼인데
+    // (K1 누르고 30초 왕복 → 보드가 Cohen's d 로 판정), 그게 연결돼 있지 않았다.
+    // 레이더의 미검증 항목이 남아 있던 이유 중 하나가 이것이다.
+    keys_poll();    // 30ms 디바운스는 함수 안에 있다
     web_poll();     // 요청 처리. 막지 않으므로 CSI 콜백을 방해하지 않는다.
     watch_poll();   // 50Hz 로 훑는다. 사람 손가락에는 충분하다.
     blink_poll();   // LED 응답 큐. 막지 않으므로 CSI 를 놓치지 않는다.
@@ -1738,27 +1766,40 @@ void loop()
 
     // ── 웹 스냅샷을 채운다. 웹 코드가 센싱 내부를 직접 들여다보지 않게 여기서만 쓴다.
     {
-        g_snap.n_sc = n_sc;
-        // 마지막으로 받은 프레임의 진폭을 dB 스케일로 옮긴다. 링의 최신 행을 쓴다.
-        if (ring_iq && ring_w) {
-            const int8_t *row = ring_iq + (size_t)((ring_w - 1) % RING_N) * 2 * MAX_SC;
-            for (int f = 0; f < n_sc && f < 128; f++) {
-                const float im = row[2 * f], re = row[2 * f + 1];
-                const float a = sqrtf(im * im + re * re);
-                // 20*log10 을 -128..127 로. 진폭 1 → -128, 진폭 90 → +100 근처.
-                float db = (a > 0.5f) ? (60.0f * log10f(a) - 128.0f) : -128.0f;
-                if (db > 127.0f) db = 127.0f;
-                if (db < -128.0f) db = -128.0f;
-                g_snap.amp[f] = (int8_t)db;
-            }
-        }
+        // sc_z / w_dev / base_ok / n_sc 는 csi_cb 가 프레임마다 채운다 —
+        // 워터폴이 1초에 한 줄만 바뀌면 브라우저가 같은 줄을 다섯 번 그린다.
         g_snap.band = band_score();
         g_snap.thresh = thresh;
         g_snap.n_anchor = (uint8_t)n_anchor;
         for (int k = 0; k < n_anchor && k < 8; k++) {
             g_snap.anchor_z[k] = anchors[k].z;
+            g_snap.anchor_sd[k] = anchors[k].sd;
             g_snap.anchor_last[k] = anchors[k].addr[5];
             g_snap.anchor_rssi[k] = anchors[k].last;
+        }
+        // 전자종이 네 페이지 몫. 5초마다 읽어가므로 1초 갱신이면 충분하다.
+        for (int s = 0; s < WS_N_SCALE && s < N_SCALE; s++) {
+            g_snap.trend_n[s] = trend_n[s];
+            g_snap.scale_sec[s] = SCALE_SEC[s];
+            for (int i = 0; i < WS_TREND_N && i < TREND_N; i++)
+                g_snap.trend[s][i] = trend[s][i];
+        }
+        for (int i = 0; i < 24; i++) g_snap.hour_cnt[i] = hour_cnt[i];
+        g_snap.ev_total = ev_total;
+        g_snap.have_clock = have_clock ? 1 : 0;
+        g_snap.probe_tx = probe_tx; g_snap.probe_fail = probe_fail;
+        {
+            uint8_t w = 0;
+            for (int k = 0; k < N_EVENT && w < WS_N_EVENT; k++) {
+                const Event &e = events[(ev_w + N_EVENT - 1 - k) % N_EVENT];
+                if (!e.t_start) continue;
+                g_snap.events[w].ago_s = (millis() - e.t_start) / 1000;
+                g_snap.events[w].dur_s = e.dur_s;
+                g_snap.events[w].peak = e.peak;
+                g_snap.events[w].hot_anchor = e.hot_anchor;
+                w++;
+            }
+            g_snap.n_events = w;
         }
         g_snap.infer_ms = infer_ms;
         g_snap.cls_hit = cls_hit; g_snap.cls_tot = cls_tot;
@@ -1779,6 +1820,7 @@ void loop()
             const double pooled = sqrt((sm * sm + su * su) / 2.0);
             g_snap.cohen_d = (pooled > 1e-9) ? (float)((mm - um) / pooled) : 0.0f;
         } else g_snap.cohen_d = 0.0f;
+        g_snap.verified = detector_verified() ? 1 : 0;
     }
 
     // 사건을 판정한다. 화면 갱신은 여기서만 예약된다 — 시간이 됐다는 것은

@@ -30,23 +30,57 @@ void web_poll(void);
 
 // 센싱 쪽이 매 프레임 채워주는 스냅샷. 웹은 이것만 읽는다 —
 // 웹 코드가 센싱 내부를 직접 들여다보면 둘을 따로 고칠 수 없다.
+// 전자종이를 안 쓰면 웹이 네 페이지 몫을 전부 받아야 한다. 그래서 스냅샷이
+// 전자종이가 갖고 있던 것(4개 시간축 추세·사건 목록·24시간 히스토그램·검증 판정)까지
+// 담는다. 빠른 것(프레임마다)과 느린 것(1초마다)을 나눠 채운다 — 추세 1KB 를 프레임마다
+// 복사할 이유가 없다.
+#define WS_TREND_N   72
+#define WS_N_SCALE    4
+#define WS_N_EVENT   24
+#define WS_N_WCH      3
+
+struct WebEvent {
+    uint32_t ago_s;           // 몇 초 전에 시작했나 (브라우저가 시각을 몰라도 그릴 수 있다)
+    uint16_t dur_s;
+    float    peak;
+    uint8_t  hot_anchor;
+};
+
 struct WebSnap {
+    // ── 프레임마다 (센싱 콜백)
     uint8_t  n_sc;
-    int8_t   amp[128];        // 서브캐리어별 진폭(dB 스케일, -128..127)
+    int8_t   sc_z[128];       // 서브캐리어별 편차 z × 8, 0..127 로 자름.
+                              // 원시 진폭이 아니라 **판정에 쓰는 값**을 보여준다 —
+                              // 워터폴에서 눈에 보이는 것과 점수가 같은 출처여야 한다.
     float    band, thresh;
-    float    anchor_z[8];
-    uint8_t  anchor_last[8];  // MAC 마지막 바이트 — 화면에서 링크를 구분한다
-    int8_t   anchor_rssi[8];
-    uint8_t  n_anchor;
+    float    w_dev[WS_N_WCH]; // 채널별 편차. band 는 이것들의 최댓값이다
+    uint8_t  base_ok;         // 비트마스크: 채널별 기준선 학습 완료
+    uint32_t csi_hz;
     uint32_t infer_ms, cls_hit, cls_tot;
     int      last_cls;
     float    last_score;
+
+    // ── 1초마다 (추세 tick)
+    float    anchor_z[8];
+    float    anchor_sd[8];
+    uint8_t  anchor_last[8];  // MAC 마지막 바이트 — 화면에서 링크를 구분한다
+    int8_t   anchor_rssi[8];
+    uint8_t  n_anchor;
+    float    trend[WS_N_SCALE][WS_TREND_N];
+    uint32_t trend_n[WS_N_SCALE];
+    uint16_t scale_sec[WS_N_SCALE];
+    WebEvent events[WS_N_EVENT];
+    uint8_t  n_events;        // 채워진 개수 (최근 것이 앞)
+    uint32_t ev_total;
+    uint8_t  hour_cnt[24];
+    uint8_t  have_clock;
     int      n_ble;
     uint32_t ble_adv;
-    uint32_t csi_hz;
     uint32_t uptime_s, boot_n;
     uint32_t mark_n, unmark_n;
     float    cohen_d;
+    uint8_t  verified;        // Cohen's d >= 0.8 이고 양쪽 표본 10개 이상
+    uint32_t probe_tx, probe_fail;
 };
 extern WebSnap g_snap;
 
