@@ -87,6 +87,9 @@ def main() -> int:
     ap.add_argument("--ood-texts", default=OOD_TEXTS_JSON)
     ap.add_argument("--ood-only", action="store_true",
                     help="명령은 건너뛰고 OOD 만 합성해 기존 manifest 에 덧붙인다")
+    ap.add_argument("--wake-only", action="store_true",
+                    help="commands.json 의 wake_candidates 만 합성한다 (label=_wake). "
+                         "호출어는 보류 보이스에서도 재야 하므로 전 보이스·전 속도로 만든다")
     ap.add_argument("--ood-train-voices", type=int, default=3,
                     help="OOD 문장당 학습 보이스 수 (보류 보이스는 별도로 전부 붙는다)")
     ap.add_argument("--holdout-voices", nargs="+", default=["F5", "M5"],
@@ -108,7 +111,16 @@ def main() -> int:
 
     # (label, text, voice, speed, group) 작업 목록
     jobs: list[tuple[str, str, str, float, str]] = []
-    if not args.ood_only:
+
+    # 호출어는 명령과 같은 취급으로 전 보이스·전 속도를 만든다. 보류 보이스에서
+    # 재현율을 재야 하고, 학습 보이스로 프로토타입을 등록해야 하기 때문이다.
+    if args.wake_only:
+        for text in spec.get("wake_candidates", []):
+            for v in args.voices:
+                for sp in args.speeds:
+                    jobs.append(("_wake", text, v, sp, "wake"))
+
+    if not args.ood_only and not args.wake_only:
         for it in intents:
             for text in it["phrases"]:
                 for v in args.voices:
@@ -121,6 +133,9 @@ def main() -> int:
     # 목소리 + 처음 듣는 문장" 으로 평가해야 정직한 숫자가 나온다. 예전 배정 방식은
     # (vi*6+k)%30 순환이라 F5/M5 에 걸린 OOD 문장이 6개뿐이었고, 그래서 52.8% 는
     # 클립 36개(19/36) 위의 수였다 — ±16%p 짜리 지표였다.
+    if args.wake_only:
+        args.ood_groups = []          # 호출어만 만든다
+
     hv = [v for v in args.holdout_voices if v in args.voices]
     train_pool = [v for v in args.voices if v not in hv]
     n_tv = max(1, min(args.ood_train_voices, len(train_pool)))

@@ -180,6 +180,31 @@ def main() -> int:
         print(f"OOD 프로토타입 {len(ood_protos)}개 "
               f"(학습 OOD 문장 {len(by_text)}개 → {ood_protos.nbytes/1024:.1f}KB)")
 
+    # ── 호출어 프로토타입. 명령 86개 앞에 1개가 서는 셈이다.
+    #
+    # 호출어는 학습 데이터에 없다 — 그래서 이 등록이 성립하는 것 자체가 "재학습 없이
+    # 새 문구가 된다" 는 설계 주장의 증거다. 임계값은 호출어 재현율 95% 지점에서 잡고,
+    # 그때 명령 문구와 OOD 가 호출어로 잡히는 비율을 eval_wake.py 가 따로 낸다.
+    wake_text = spec.get("wake_phrase") or ""
+    wake_proto = np.zeros((0, ck["dim"]), np.float32)
+    wake_thr = 0.0
+    if wake_text:
+        wk_en = [it for it in items if it["label"] == "_wake"
+                 and it["text"] == wake_text and it["voice"] in en_v]
+        wk_te = [it for it in items if it["label"] == "_wake"
+                 and it["text"] == wake_text and it["voice"] in te_v]
+        if wk_en and wk_te:
+            v = F.normalize(embed(model, [read_wav_i16(root / it["path"])
+                                          for it in wk_en], dev).mean(0), dim=0).numpy()
+            wake_proto = v[None, :]
+            s = embed(model, [read_wav_i16(root / it["path"]) for it in wk_te],
+                      dev).numpy() @ v
+            wake_thr = float(np.quantile(s, 0.05))     # 호출어 재현율 95%
+            print(f"호출어 \"{wake_text}\": 등록 {len(wk_en)}클립, 임계 {wake_thr:.3f} "
+                  f"(보류 보이스 재현율 95%)")
+        else:
+            print(f"호출어 \"{wake_text}\" 클립이 없다 — gen_data.py --wake-only 먼저")
+
     # 판정식은 마진 하나다: (명령 최고 코사인) − (OOD 최고 코사인) ≥ CN_REJECT_MARGIN.
     # 은행이 비면 두 번째 항이 0 이라 예전 절대 임계값 판정으로 축퇴한다.
     # 임계값은 명령 재현율 95% 지점에서 잡는다 — 기제를 바꿔도 재현율이 고정되므로
@@ -244,6 +269,16 @@ def main() -> int:
          "static const char *const cn_proto_text[CN_N_PROTO] = {",
          *[f'  "{t}",' for t, _ in phrases],
          "};\n",
+         "// ── 호출어. 이것이 먼저 잡히지 않으면 명령을 아예 보지 않는다.",
+         "// 상시 인식을 없애는 것이 오수락을 줄이는 가장 확실한 방법이다 — 프로토타입",
+         "// 86개 앞에 1개가 서고, 그 1개는 명령·OOD 어휘와 겹치지 않게 골랐다.",
+         "// CN_N_WAKE 가 0 이면 게이트 없이 예전처럼 동작한다.",
+         f"#define CN_N_WAKE {len(wake_proto)}",
+         f"#define CN_WAKE_THR {wake_thr:.4f}f"
+         "   // 호출어 재현율 95% 지점 (보류 보이스 실측)",
+         f'static const char *const cn_wake_text = "{wake_text}";',
+         (c_float_array("cn_wake_protos", wake_proto) if len(wake_proto)
+          else "static const float cn_wake_protos[1] = {0.0f};  // 비어 있음\n"),
          "// ── 거부용 OOD 프로토타입. 명령이 아닌 말들의 중심이다.",
          "// 판정: 명령 최고점이 CN_REJECT_THR 미만이거나, OOD 최고점보다 낮으면 거부.",
          "// 임계값 하나로만 자르면 오수락이 안 잡혀서(측정) 이 은행을 같이 쓴다.",

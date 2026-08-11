@@ -37,6 +37,12 @@ static const int  DMA_FRAMES     = 256;
 static const int  MAX_UTTER_SEC  = 3;      // 인식에 쓸 최대 발화 길이
 static const uint16_t TABLET_PORT = 8770;  // 태블릿이 여는 TCP 포트
 
+// 호출어 뒤 명령을 받는 창. 너무 짧으면 사람이 두 번 말해야 하고, 너무 길면 게이트가
+// 없는 것과 같아진다. 8초면 "하이 캐빈" 하고 한 박자 뒤 말하기에 넉넉하다.
+// 이 값을 0 으로 두거나 CN_N_WAKE 가 0 이면 게이트 없이 예전처럼 동작한다.
+#define CN_WAKE_WINDOW_MS 8000
+static uint32_t wake_until = 0;             // 이 시각까지 명령을 받는다
+
 // ── 상태
 static AC101       codec;
 static cn_ctx_t    infer;
@@ -245,6 +251,36 @@ static void brain_task(void *)
         float emb[CN_EMB_DIM];
         cn_encode(&infer, mel_buf, emb);
         const uint32_t t2 = millis();
+
+        // ── 호출어 게이트. 오수락을 줄이는 가장 확실한 방법은 임계값을 조이는 것이
+        // 아니라 **듣지 않는 것**이다.
+        //
+        // 프로토타입 86개를 늘 열어두면 무슨 소리든 그중 하나와는 우연히 가깝다.
+        // 게이트를 두면 그 86개 앞에 1개가 서고, 그 1개는 명령·OOD 어휘와 겹치지
+        // 않게 골랐다("하이 캐빈"). 실측(보류 보이스, 호출어 재현율 95%): 명령 문구가
+        // 호출어로 잡히는 비율 0.2%, 명령 아닌 말 0.0%.
+        //
+        // 주의: 그 숫자는 잘라낸 단발 발화 기준이다. 스트리밍에서는 창이 계속 밀리므로
+        // 노출 횟수가 훨씬 많다 — 시간당 오각성은 보드에서 재야 한다.
+#if CN_N_WAKE > 0
+        {
+            float ws = 0.0f;
+            cn_match(emb, cn_wake_protos, CN_N_WAKE, &ws);
+            if (ws >= CN_WAKE_THR) {
+                wake_until = millis() + CN_WAKE_WINDOW_MS;
+                Serial.printf("[brain] 호출어 \"%s\" (%.3f) — %lu초 동안 명령을 받는다\n",
+                              cn_wake_text, ws,
+                              (unsigned long)(CN_WAKE_WINDOW_MS / 1000));
+                continue;               // 호출어 자체는 명령이 아니다
+            }
+            if (!wake_until || (int32_t)(millis() - wake_until) > 0) {
+                // 조용히 버리지 않는다. "왜 반응이 없나" 를 로그로 알 수 있어야 한다.
+                Serial.printf("[brain] 대기 중 — \"%s\" 를 먼저 불러 주세요 (호출어 %.3f)\n",
+                              cn_wake_text, ws);
+                continue;
+            }
+        }
+#endif
 
         float score = 0.0f;
         const int row = cn_match(emb, cn_protos, CN_N_PROTO, &score);
