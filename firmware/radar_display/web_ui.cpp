@@ -133,10 +133,15 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 <script>
 const $ = id => document.getElementById(id);
 const AX = {stroke:'#8b949e', grid:{stroke:'#21262d'}, ticks:{stroke:'#21262d'}};
-const mk = (el, opts) => new uPlot(Object.assign({
-  width: el.clientWidth, height: el.clientHeight, padding:[8,8,0,0],
-  axes:[AX,AX], cursor:{y:false}, legend:{live:true},
-}, opts), [[0],[0]], el);
+const mk = (el, opts) => {
+  // 초기 데이터는 **시리즈 수만큼** 줘야 한다. [[0],[0]] 을 고정으로 주면 시리즈가
+  // 3개 이상인 차트(채널별 편차)가 로드 시점에 길이 불일치로 죽는다.
+  const n = (opts.series||[]).length || 2;
+  return new uPlot(Object.assign({
+    width: el.clientWidth, height: el.clientHeight, padding:[8,8,0,0],
+    axes:[AX,AX], cursor:{y:false}, legend:{live:true},
+  }, opts), Array.from({length:n}, ()=>[0]), el);
+};
 
 // 임계값 선은 uPlot 훅으로 그린다. 시리즈로 넣으면 범례가 지저분해진다.
 function thrHook(getThr){
@@ -314,7 +319,7 @@ static void h_fast(void)
 static void h_hist(void)
 {
     String j;
-    j.reserve(4200);
+    j.reserve(5200);
     j = "{\"trend\":[";
     for (int s = 0; s < WS_N_SCALE; s++) {
         if (s) j += ',';
