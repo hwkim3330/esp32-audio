@@ -32,9 +32,19 @@
 #define ENABLE_SOUND 0
 #include "peanut_gb.h"
 
-// ── 대상 태그. 여러 장을 돌리지 않는다 — 한 장이 화면이고, 그 한 장의 갱신 예산을 쓴다.
-// 앵커 측정에서 가장 조용하고 가까웠던 태그다(-50.4dBm, 편차 2.29dB).
-static const uint8_t TAG_SUFFIX = 0x78;
+// ── 대상 태그 두 장을 **번갈아** 쓴다.
+//
+// 실측이 병목을 정확히 지목했다:
+//     연결 9397 / 서비스 0 / 협상 735 / 전송 673 / 패널 30 ms
+// 패널은 30ms, 전송은 0.7초인데 **연결이 9.4초**다. 리프레시가 끝나면 태그가 자기 쪽에서
+// 링크를 끊고 잠든다(배터리 기기다). 그 다음 연결은 태그가 다시 광고할 때까지 기다리는
+// 시간이고 우리가 깨울 방법이 없다.
+//
+// 그래서 두 장을 번갈아 쓴다. A 를 굽고 A 가 자는 동안 B 를 굽는다 — B 를 굽는 시간이
+// A 의 회복 시간이 되므로 그 9초가 대기가 아니라 일하는 시간이 된다. 화면은 두 장이고
+// 최신 상태는 방금 갱신된 쪽에 있다.
+static const uint8_t TAG_SUFFIX[] = { 0x78, 0x81 };
+#define N_TAG (sizeof(TAG_SUFFIX) / sizeof(TAG_SUFFIX[0]))
 
 // ── 버튼 6개 → 게임보이 8개. 두 개가 모자라므로 길게 누르기로 겹친다.
 #define N_KEYS 6
@@ -64,8 +74,25 @@ static uint8_t *trail = nullptr;        // 160x144 누적 밝기(궤적)
 static GFXcanvas1 *cbw = nullptr, *cred = nullptr;
 static U8G2_FOR_ADAFRUIT_GFX u8g2;
 static uint8_t esl_buf[ESL_BYTES];
-static EslTag tag;
+static EslTag tags[N_TAG];
+static bool tag_ok[N_TAG] = { false };
+static int  n_tag = 0, next_tag = 0;
 static bool have_tag = false;
+
+// ── 적색 평면 A/B. 갱신마다 번갈아 보내고 같은 태그에서 짝비교한다.
+//
+// 안 쓰는 적색을 보내면 페이로드가 두 배(4736→9472)이고 태그가 BWR 웨이브폼을 돌 것으로
+// 보이는데, **깜박임은 우리가 잴 수 없다**(태그가 완료를 알린 뒤 자기 패널을 굽는다.
+// 우리 계측의 '패널 30ms' 는 완료 통보까지의 시간이고 실제 굽는 시간이 아니다).
+// 그래서 시간은 로그로, 깜박임은 사람이 눈으로 판정한다. 한 번의 굽기에서 두 조건이
+// 번갈아 나오므로 태그 상태·거리·배터리가 같은 조건에서 비교된다.
+//
+// **결론: 적색은 안 보낸다(AB_RED 0).** 짝비교 실측에서 전송이 정확히 두 배였고
+// (20파트 673ms 대 40파트 1273ms) 우리는 적색을 화면에 쓰지 않는다. 비교를 다시 하려면
+// AB_RED 1 로 두면 갱신마다 번갈아 나간다.
+#define AB_RED 0
+static bool ab_bw_only = true;      // 매 갱신마다 뒤집힌다
+static bool tx_bw_only = true;      // 이번 전송이 어느 쪽인지
 
 static uint32_t frames = 0, pushes = 0, last_push = 0;
 static uint8_t *last_sent = nullptr;    // 마지막으로 보낸 1비트 이미지(142x128 팩)
@@ -158,13 +185,16 @@ static void compose(void)
     u8g2.setCursor(GX + 10, y); u8g2.printf("frames %lu", (unsigned long)frames); y += 10;
     u8g2.setCursor(GX + 10, y); u8g2.printf("pushes %lu", (unsigned long)pushes); y += 10;
     u8g2.setCursor(GX + 10, y);
-    u8g2.printf("%.2f V", tag.have_mfg ? tag.volts : 0.0f); y += 14;
+    u8g2.printf("%.2fV  x%d tags", tags[0].have_mfg ? tags[0].volts : 0.0f,
+                n_tag); y += 14;
     u8g2.setCursor(GX + 10, y); u8g2.print("K1-4 dpad  K5 A  K6 B"); y += 10;
     u8g2.setCursor(GX + 10, y); u8g2.print("K5+K6 START"); y += 10;
     u8g2.setCursor(GX + 10, y); u8g2.print("K3+K4 SELECT"); y += 10;
     u8g2.setCursor(GX + 10, y); u8g2.print("K1+K2 push now"); y += 14;
     u8g2.setCursor(GX + 10, y);
     u8g2.printf("gap>=%ds diff>=%d%%", PUSH_MIN_GAP_MS / 1000, PUSH_DIFF_PCT);
+    y += 10; u8g2.setCursor(GX + 10, y);
+    u8g2.printf("plane: %s", ab_bw_only ? "BW" : "BW+RED");
 }
 
 // 보낼 만한 변화인가. 합성된 흑백 평면을 마지막으로 보낸 것과 비교한다 —
@@ -182,20 +212,67 @@ static int diff_pct(void)
     return (int)(bits * 100 / (ESL_W * ESL_H));
 }
 
+// ── 전송은 **다른 코어에서** 한다.
+//
+// 실측으로 한 번 보내는 데 13.6초가 걸리는데 그 내역이 이렇다:
+//     연결 11592 / 서비스 0 / 협상 736 / 전송 1288 / 패널 30 ms
+// 패널 리프레시는 30ms 로 사실상 공짜고, 페이로드도 1.3초다. **11.6초는 연결 수립**이고,
+// 그건 태그가 리프레시 후 잠들어 광고를 안 하는 시간이다 — 우리가 깨울 방법이 없다.
+// connect() 가 무한 대기로 들어가 있어서 그 시간을 그대로 기다린다.
+//
+// 그래서 시간을 줄이는 대신 **게임을 멈추지 않게** 한다. 업로드를 코어 0 의 태스크로
+// 넘기면 에뮬레이터는 코어 1 에서 계속 60fps 로 돈다. 화면 지연은 남지만 게임이
+// 얼어붙지 않는다 — 13.6초 프리즈가 사라지는 것이 체감상 가장 큰 차이다.
+//
+// **적색 평면은 보내지 않는다.** 우리는 적색을 안 쓰는데 적색 평면을 보내면 태그가
+// BWR 웨이브폼(길고 깜박이는 쪽)을 돈다. 페이로드도 절반이 된다(9472 → 4736).
+// 전제: 지금까지 적색 평면을 흰색으로 채워 보냈으므로 적색 레이어가 이미 깨끗하다.
+// (전자종이는 잔류형이라 안 보내면 지워지지 않고 남는다 — 더러운 상태에서 끊으면
+//  그 적색이 영구히 남는다.)
+static uint8_t  tx_buf[ESL_BYTES];
+static size_t   tx_len = 0;
+static volatile bool tx_pending = false, tx_busy = false;
+static char     tx_why[40];
+
+
+static void tx_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (tx_pending && have_tag) {
+            tx_busy = true;
+            const int t = next_tag;
+            next_tag = (next_tag + 1) % n_tag;      // 다음은 다른 장으로
+            uint32_t ms = 0, parts = 0;
+            const EslResult r = esl_upload(tags[t].addr, tx_buf, tx_len, &ms, &parts,
+                                           true);
+            Serial.printf("[eink] :%02X [%s %uB] %s → %s  %lums  %lu파트\n",
+                          tags[t].addr[5], tx_bw_only ? "흑백" : "흑백+적",
+                          (unsigned)tx_len, tx_why, esl_result_name(r),
+                          (unsigned long)ms, (unsigned long)parts);
+            if (r == ESL_OK) pushes++;
+            last_push = millis();      // 실패해도 하한을 다시 센다(연달아 매달리지 않게)
+            tx_pending = false;
+            tx_busy = false;
+        }
+        vTaskDelay(20 / portTICK_PERIOD_MS);
+    }
+}
+
 static bool push_now(const char *why)
 {
-    if (!have_tag) return false;
-    const size_t len = esl_pack(tag, *cbw, *cred, esl_buf, false);
-    uint32_t ms = 0, parts = 0;
-    // 링크를 붙들고 쓴다. 같은 태그에 계속 보내므로 연결 수립을 매번 할 이유가 없다.
-    const EslResult r = esl_upload(tag.addr, esl_buf, len, &ms, &parts, true);
-    Serial.printf("[eink] %s → %s  %lums  %lu파트\n", why, esl_result_name(r),
-                  (unsigned long)ms, (unsigned long)parts);
-    if (r != ESL_OK) return false;
-    pushes++;
-    last_push = millis();
+    if (!have_tag || tx_busy || tx_pending) return false;
+#if AB_RED
+    tx_bw_only = ab_bw_only;
+    ab_bw_only = !ab_bw_only;
+#else
+    tx_bw_only = true;
+#endif
+    tx_len = esl_pack(tags[next_tag], *cbw, *cred, tx_buf, tx_bw_only);
+    snprintf(tx_why, sizeof tx_why, "%s", why);
     if (!last_sent) last_sent = (uint8_t *)malloc((size_t)ESL_W * (ESL_H / 8));
     if (last_sent) memcpy(last_sent, cbw->getBuffer(), (size_t)ESL_W * (ESL_H / 8));
+    tx_pending = true;                 // 여기서부터는 코어 0 이 가져간다
     return true;
 }
 
@@ -278,30 +355,64 @@ void setup(void)
     Serial.printf("gb_init 통과. 프레임/궤적 내부 DRAM, 세이브램 %dKB PSRAM\n",
                   GB_CART_RAM_LEN / 1024);
 
+    // 파트 크기는 태그가 정하지만 그 값은 보통 ATT MTU 에서 온다.
+    // 크게 요청해 두고 태그가 더 큰 파트를 주는지 로그로 확인한다(거절하면 그대로).
     BLEDevice::init("");
+    BLEDevice::setMTU(517);
     EslTag found[ESL_MAX_TAG];
     const int n = esl_scan(found, ESL_MAX_TAG, 6);
     Serial.printf("[eink] 태그 %d대\n", n);
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++)
         Serial.printf("  :%02X %s %.2fV\n", found[i].addr[5], found[i].name,
                       found[i].volts);
-        if (found[i].addr[5] == TAG_SUFFIX) { tag = found[i]; have_tag = true; }
-    }
-    if (!have_tag && n > 0) { tag = found[0]; have_tag = true;
-        Serial.printf("[eink] :%02X 를 못 찾아 :%02X 로 대체\n", TAG_SUFFIX, tag.addr[5]); }
+    // 지정한 두 장만 쓴다. 못 찾은 것은 건너뛰고 찾은 것끼리 번갈아 돈다 —
+    // 지정 안 한 태그로 대체하지 않는다(벽의 다른 정보를 덮고 그 셀을 태운다).
+    for (size_t t = 0; t < N_TAG; t++)
+        for (int i = 0; i < n; i++)
+            if (found[i].addr[5] == TAG_SUFFIX[t]) {
+                tags[n_tag] = found[i];
+                tag_ok[n_tag] = true;
+                Serial.printf("[eink] :%02X 사용 (%.2fV)\n", found[i].addr[5],
+                              found[i].volts);
+                n_tag++;
+                break;
+            }
+    have_tag = (n_tag > 0);
+    if (!have_tag) Serial.println("[eink] 지정 태그가 없다 — 화면 없이 돈다");
+    else if (n_tag == 1)
+        Serial.println("[eink] 한 장뿐 — 번갈아 쓰기 이득이 없다(연결 대기 9초 그대로)");
     Serial.println(have_tag ? "[eink] 준비됨" : "[eink] 태그 없음 — 화면 없이 돈다");
+
+    // 에뮬레이터는 코어 1(아두이노 loop)에, 전송은 코어 0 에. 13.6초 프리즈를 없앤다.
+    xTaskCreatePinnedToCore(tx_task, "esl_tx", 6144, nullptr, 1, nullptr, 0);
 }
 
 void loop(void)
 {
+    // 프레임 페이싱. 없으면 칩이 낼 수 있는 만큼 돌아서 게임이 빨라진다 —
+    // 실측 75fps(실제 게임보이는 59.73fps)로 25% 빠르게 돌았다. 속도가 빠른 것은
+    // 성능이 좋은 것이 아니라 **게임이 틀리게 도는 것**이다(대사 속도, 인카운터 타이밍).
+    static uint32_t next_us = 0;
+    const uint32_t now_us = micros();
+    if (next_us && (int32_t)(next_us - now_us) > 0) {
+        const uint32_t wait = next_us - now_us;
+        if (wait > 2000) vTaskDelay(1);          // 다른 코어·BLE 에 CPU 를 넘긴다
+        else delayMicroseconds(wait);
+        return;
+    }
+    next_us = (next_us ? next_us : now_us) + 16743;   // 1/59.7275 s
+    if ((int32_t)(now_us - next_us) > 100000) next_us = now_us + 16743;  // 크게 밀리면 재동기
+
     keys_poll();
     gb_run_frame(&gb);
     frames++;
     trail_accum();
 
     // 갱신 판정. 하한을 먼저 보는 이유: 하한을 안 넘겼으면 합성 비용조차 쓸 이유가 없다.
-    const bool due = (millis() - last_push) >= PUSH_MIN_GAP_MS;
-    if (force_push || due) {
+    // 두 장이면 장당 간격은 그대로인데 화면 갱신 주기는 절반이 된다.
+    const uint32_t gap = (n_tag > 1) ? (PUSH_MIN_GAP_MS / n_tag) : PUSH_MIN_GAP_MS;
+    const bool due = (millis() - last_push) >= gap;
+    if (!tx_busy && !tx_pending && (force_push || due)) {
         compose();
         const int d = diff_pct();
         if (force_push) { push_now("강제(K6 2초)"); force_push = false; }
@@ -316,7 +427,8 @@ void loop(void)
     }
 
     if (frames % 600 == 0)
-        Serial.printf("[gb] %lu 프레임, 갱신 %lu회, 여유 DRAM %uKB\n",
+        Serial.printf("[gb] %lu 프레임, 갱신 %lu회%s, 여유 DRAM %uKB\n",
                       (unsigned long)frames, (unsigned long)pushes,
+                      (tx_busy || tx_pending) ? " (전송 중)" : "",
                       (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
 }

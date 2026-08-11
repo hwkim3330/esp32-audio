@@ -1,5 +1,7 @@
 #include "esl_bwr.h"
 
+#include <esp_gap_ble_api.h>
+
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -217,11 +219,14 @@ EslResult esl_upload(const uint8_t addr[6], const uint8_t *payload, size_t len,
                      uint32_t *ms_out, uint32_t *parts_out, bool keep_open)
 {
     const uint32_t t_start = millis();
+    uint32_t t_conn = 0, t_svc = 0, t_neg = 0, t_lastpart = 0;
     g_got01 = g_got05 = g_hasAck = false;
     g_partMsgSize = 244;
 
     if (!s_cli) s_cli = BLEDevice::createClient();
     BLEClient *cli = s_cli;
+    bool retried_small = false;
+again:
 
     // 이미 이 태그에 붙어 있으면 그대로 쓴다. 링크를 다시 세우는 데 쓰이던
     // disconnect(600ms) + connect + delay(300ms) 가 전부 사라진다.
@@ -243,9 +248,30 @@ EslResult esl_upload(const uint8_t addr[6], const uint8_t *payload, size_t len,
         delay(300);
         memcpy(s_cur_addr, addr, 6);
         s_cur_valid = true;
+
+        // ── 연결 간격을 최소로 당긴다.
+        //
+        // 파트는 못 줄인다: 태그가 파트 크기를 244(데이터 240B)로 협상해주고 그게 상한이며,
+        // 이 모델(296x128)은 모델 표에 compression=false 라 페이로드도 못 줄인다.
+        // 그래서 **파트당 시간**을 줄인다. 실측 20파트 675ms = 파트당 34ms 인데,
+        // write-without-response 인데도 이렇게 느린 것은 파트마다 태그의 0x05 응답을
+        // 기다리는 왕복이기 때문이다. 왕복 지연은 곧 연결 간격이므로 그것을 당기면
+        // 파트 수를 안 건드리고 전송이 짧아진다.
+        //
+        // 7.5ms(6 * 1.25ms)를 요청한다. 태그가 거절하면 자기 값을 유지하므로 손해는 없다.
+        esp_ble_conn_update_params_t cp = {};
+        memcpy(cp.bda, addr, 6);
+        cp.min_int = 6;      // 7.5ms
+        cp.max_int = 12;     // 15ms
+        cp.latency = 0;
+        cp.timeout = 400;    // 4초
+        esp_ble_gap_update_conn_params(&cp);
+        delay(120);          // 파라미터 갱신이 반영될 틈
     }
+    t_conn = millis();
     BLERemoteService *svc = cli->getService(SVC_UUID);
     if (!svc) { res = ESL_ERR_SERVICE; goto done; }
+    t_svc = millis();
     {
         BLERemoteCharacteristic *cmd = svc->getCharacteristic(CMD_UUID);
         BLERemoteCharacteristic *img = svc->getCharacteristic(IMG_UUID);
@@ -303,9 +329,21 @@ EslResult esl_upload(const uint8_t addr[6], const uint8_t *payload, size_t len,
         // 됐고 다른 대는 244를 줘서 40개(3.8초)였다. 같은 모델인데 5배 차이다.
         Serial.printf("      [협상] 파트메시지 %u → 데이터 %u바이트\n",
                       (unsigned)g_partMsgSize, (unsigned)dataSz);
+        // 20 으로 협상되면 파트가 20배로 늘어난다(실측 전송 1.3초 → 9.0초).
+        // 같은 태그가 다음 회차에는 244 를 주므로, 작게 나오면 링크를 새로 맺어
+        // 한 번 더 물어보는 것이 훨씬 싸다.
+        if (g_partMsgSize < 64 && !retried_small) {
+            Serial.println("      [협상] 너무 작다 — 연결을 새로 맺어 다시 물어본다");
+            retried_small = true;
+            if (cli->isConnected()) cli->disconnect();
+            delay(600);
+            s_cur_valid = false;
+            goto again;
+        }
         const uint32_t parts = (uint32_t)((len + dataSz - 1) / dataSz);
         if (parts_out) *parts_out = parts;
 
+        t_neg = millis();
         uint8_t c2[8] = { 0x02, (uint8_t)(len & 0xFF), (uint8_t)((len >> 8) & 0xFF),
                           (uint8_t)((len >> 16) & 0xFF), (uint8_t)((len >> 24) & 0xFF),
                           0, 0, 0 };
@@ -326,6 +364,7 @@ EslResult esl_upload(const uint8_t addr[6], const uint8_t *payload, size_t len,
             memcpy(&chunk[4], payload + off, n);
             img->writeValue(chunk.data(), chunk.size(), false);
             last_tx = millis();
+            t_lastpart = last_tx;
         };
         send_part(0);
 
@@ -349,7 +388,10 @@ EslResult esl_upload(const uint8_t addr[6], const uint8_t *payload, size_t len,
                 if (++stalls > 20) { res = ESL_ERR_TRANSFER; goto done; }
             }
             if (millis() - t_start > 90000) { res = ESL_ERR_TIMEOUT; goto done; }
-            delay(5);
+            // 파트당 33ms 가 라디오 간격인지 이 폴링 간격인지 가른다. 5ms 로 훑으면
+            // 알림이 와도 최악 5ms 늦게 보고, 그 사이 다음 파트를 못 보낸다.
+            // 1ms 로 줄여서 전송 시간이 변하는지 본다(안 변하면 연결 간격이 범인이다).
+            delay(1);
         }
     }
 done:
@@ -361,5 +403,14 @@ done:
         s_cur_valid = false;
     }
     if (ms_out) *ms_out = millis() - t_start;
+    // 구간별 시간. 마지막 파트를 보낸 뒤 완료(0x05 status 0x08)까지 걸린 시간이
+    // 곧 **패널 리프레시**다 — 그게 우리가 못 줄이는 부분이고, 나머지는 링크다.
+    Serial.printf("      [구간] 연결 %lu / 서비스 %lu / 협상 %lu / 전송 %lu / "
+                  "패널 %lu ms\n",
+                  (unsigned long)(t_conn ? t_conn - t_start : 0),
+                  (unsigned long)(t_svc && t_conn ? t_svc - t_conn : 0),
+                  (unsigned long)(t_neg && t_svc ? t_neg - t_svc : 0),
+                  (unsigned long)(t_lastpart && t_neg ? t_lastpart - t_neg : 0),
+                  (unsigned long)(t_lastpart ? millis() - t_lastpart : 0));
     return res;
 }
