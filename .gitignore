@@ -6,3 +6,5 @@ __pycache__/
 model/data/phrasepack/
 model/out/encoder_*.pt
 model/data/gen_ood*.log
+firmware/gb_eink/rom_data.h
+firmware/gb_eink/*.bin
