@@ -1,0 +1,17 @@
+# ESP32-Audio-Kit 4MB — 웹 MP3 플레이어
+#
+# OTA 를 버려 앱 슬롯을 하나만 둔다. 대신 남는 2.3MB 를 곡 저장소(LittleFS)로 쓴다.
+# 라벨은 "spiffs" 로 둬야 Arduino 의 LittleFS.begin() 기본 탐색에 걸린다(내용은 LittleFS).
+#
+# app0   = 1920K — 실측 1,831,431 바이트(BT클래식+WiFi+웹서버+디코더). 1664K 로 잡았다가
+#                  넘쳤다. arduino-cli 가 찍는 "Maximum is 16777216" 은 커스텀 파티션에서
+#                  나오는 헛값이다 — 진짜 한도는 이 표다.
+# spiffs = 2112K — SD 카드가 없을 때 쓰는 곡 저장소
+#
+# 주의: 플래그 칸 뒤에 주석을 달면 arduino-cli 가 그걸 플래그로 읽고 죽는다.
+#
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x5000
+phy_init,   data, phy,     0xe000,   0x1000
+app0,       app,  ota_0,   0x10000,  0x1E0000
+spiffs,     data, spiffs,  0x1F0000, 0x210000
