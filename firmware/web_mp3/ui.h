@@ -133,12 +133,16 @@ progress{width:100%;height:5px}
     <span id="recst" class="pill">…</span>
   </div>
   <div class="row">
-    <button class="p" id="recbtn" onclick="rec()">● 녹음 시작</button>
+    <button class="p" id="recbtn" onclick="rec(0)">● 녹음 (스테레오)</button>
+    <button id="recncbtn" onclick="rec(1)">● 잡음제거 녹음 (모노)</button>
     <span style="color:var(--dim);font-size:12px">레벨</span>
     <div class="bar" style="flex:1"><i id="lvl_l"></i></div>
     <div class="bar" style="flex:1"><i id="lvl_r"></i></div>
   </div>
-  <div class="note">44.1kHz 16비트 스테레오 WAV 로 SD 의 <code>/REC</code> 에 쓴다(초당 176KB).
+  <div class="note"><b>잡음제거</b>는 마이크 두 개로 하는 적응 필터(NLMS 12탭)다 — 한쪽을 목표,
+  다른 쪽을 잡음 기준으로 두고 상관된 성분을 뺀다. 결과는 모노(초당 88KB).
+  재생용 ANC 는 이 하드웨어로 불가능하다(루프 지연이 1ms 미만이어야 한다).<br>
+  44.1kHz 16비트로 SD 의 <code>/REC</code> 에 쓴다.
   녹음을 시작하면 재생은 멈춘다 — 마이크가 보드 위에 있어서 자기 소리를 다시 듣는다.
   받은 파일은 아래 SD 목록의 <code>/REC</code> 에서 내려받는다.</div>
 </div>
@@ -196,7 +200,9 @@ async function tick(){
   $('reccard').hidden = (s.role=='sink');
   $('recst').textContent = s.rec ? ('● 녹음 중 '+s.recsec+'초 · '+s.recname) : (s.sd?'대기':'SD 없음');
   $('recst').className='pill '+(s.rec?'bad':s.sd?'':'warn');
-  $('recbtn').textContent = s.rec ? '■ 정지' : '● 녹음 시작';
+  $('recbtn').textContent = s.rec ? '■ 정지' : '● 녹음 (스테레오)';
+  $('recncbtn').hidden = s.rec;
+  if (s.rec && s.recnc) $('recbtn').textContent = '■ 정지 (잡음제거 중)';
   $('lvl_l').style.width = Math.min(100,(s.reclvl[0]/300)*100)+'%';
   $('lvl_r').style.width = Math.min(100,(s.reclvl[1]/300)*100)+'%';
   window._rec = s.rec;
@@ -238,7 +244,7 @@ async function sd(p){
     ).join('') : '<li><span class="nm" style="color:var(--dim)">비어 있음</span></li>');
 }
 const esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
-async function rec(){ await fetch('/api/rec?on='+(window._rec?'0':'1'),{method:'POST'}); tick(); }
+async function rec(nc){ await fetch('/api/rec?on='+(window._rec?'0':'1')+'&nc='+nc,{method:'POST'}); tick(); }
 async function role(r){ if(!confirm(r=='sink'?'BT 스피커로 바꾸고 재부팅한다':'플레이어로 바꾸고 재부팅한다'))return;
   await fetch('/api/role?r='+r,{method:'POST'}); $('upmsg').textContent='역할 전환, 재부팅 중…'; }
 async function del(n){ if(!confirm(decodeURIComponent(n)+' 삭제?'))return; await fetch('/api/delete?f='+n,{method:'POST'}); tick(); }

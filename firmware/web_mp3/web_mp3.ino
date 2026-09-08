@@ -134,6 +134,7 @@ static volatile int     g_sink_ch = 2;
 static volatile uint32_t g_sink_bytes = 0;      // 싱크로 실제로 들어온 바이트
 static volatile bool     g_prebuf = false;      // 선버퍼링이 찼는가
 static volatile uint32_t g_starves = 0;         // 링이 굶어 무음을 낸 횟수
+static volatile uint32_t g_drift_skip = 0, g_drift_dup = 0;   // 드리프트 보정 횟수
 static volatile bool     g_wifi_off_audio = true;  // 스트리밍 중 WiFi 를 끈다
 static volatile int      g_wifi_req = 0;        // 1=끄기 2=켜기 (loop 에서 처리)
 static volatile uint32_t g_wifi_on_at = 0;      // 이 시각에 다시 켠다
@@ -327,6 +328,24 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t ev, esp_avrc_ct_cb_param_t *p)
         Serial.printf("[avrc] %s\n", p->conn_stat.connected ? "연결됨 — 버튼이 맥을 조작한다" : "끊김");
 }
 
+// 코덱 볼륨 적용. 정의는 아래(g_codec 선언 뒤)에 있고 여기서는 원형만 쓴다 —
+// arduino-cli 가 원형을 #include 직후에만 삽입하므로 순서를 직접 맞춰야 한다.
+static void apply_codec_volume();
+
+// AVRCP **타깃**: 맥이 절대 볼륨(0~127)을 보내면 그걸 코덱의 아날로그 볼륨으로 받는다.
+//
+// 이게 없으면 맥이 자기 쪽에서 디지털로 깎아 보낼 수 있고, 그러면 해상도가 날아가
+// 잡음이 된다(우리가 소프트웨어 감쇠로 겪은 것과 같은 문제). 아날로그로 내리는 게 맞다.
+static void avrc_tg_cb(esp_avrc_tg_cb_event_t ev, esp_avrc_tg_cb_param_t *p)
+{
+    if (ev == ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT) {
+        const int v = (int)p->set_abs_vol.volume;            // 0~127
+        g_vol = (v * 100) / 127;
+        apply_codec_volume();
+        Serial.printf("[avrc] 맥이 보낸 절대 볼륨 %d/127 → 코덱 %d/63\n", v, (g_vol * 63) / 100);
+    }
+}
+
 static void a2dp_cb(esp_a2d_cb_event_t ev, esp_a2d_cb_param_t *p)
 {
     // 싱크가 협상한 코덱 설정. SBC 헤더에서 샘플레이트·채널을 꺼낸다.
@@ -487,6 +506,14 @@ static void bt_setup()
         // AVRCP 컨트롤러도 올린다 — 이걸로 보드의 버튼이 맥의 재생을 조작한다.
         esp_avrc_ct_init();
         esp_avrc_ct_register_callback(avrc_ct_cb);
+        esp_avrc_tg_init();
+        esp_avrc_tg_register_callback(avrc_tg_cb);
+        {   // 볼륨 변경 통보를 받겠다고 알린다
+            esp_avrc_rn_evt_cap_mask_t cap = {0};
+            esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cap,
+                                               ESP_AVRC_RN_VOLUME_CHANGE);
+            esp_avrc_tg_set_rn_evt_cap(&cap);
+        }
 
         g_out = OUT_JACK;                      // 싱크의 소리는 잭으로 낸다
         Serial.println("[a2dp] **싱크(BT 스피커)** 모드 — 맥·폰에서 스캔해 연결하라");
@@ -542,6 +569,14 @@ static int16_t *g_i2s_buf = nullptr;
 static volatile uint32_t g_tone_until = 0;     // 이 시각까지 테스트음을 낸다
 static volatile uint64_t g_i2s_frames = 0;     // I2S 로 실제로 밀어낸 프레임 수
 static float g_tone_phase = 0.0f;
+
+static void apply_codec_volume()
+{
+    if (!g_codec_ok) return;
+    const uint8_t hv = (uint8_t)((g_vol * 63) / 100);
+    g_codec.SetVolumeHeadphone(hv);
+    g_codec.SetVolumeSpeaker(hv);
+}
 
 static void jack_setup()
 {
@@ -601,11 +636,7 @@ static void jack_setup()
     g_i2s_buf = (int16_t *)heap_caps_malloc((size_t)I2S_BLOCK * 2 * sizeof(int16_t), MALLOC_CAP_DMA);
     if (!g_i2s_buf) { Serial.println("[잭] DMA 버퍼 실패"); g_codec_ok = false; return; }
 
-    {   // 저장된 음량을 코덱 볼륨으로 반영한다
-        const uint8_t hv = (uint8_t)((g_vol * 63) / 100);
-        g_codec.SetVolumeHeadphone(hv);
-        g_codec.SetVolumeSpeaker(hv);
-    }
+    apply_codec_volume();       // 저장된 음량을 코덱 볼륨으로 반영
     Serial.printf("[잭] 준비됨 — HPOUT=0x%04X SPKOUT=0x%04X DAC_VOL=0x%04X\n",
                   g_codec.rd(0x56), g_codec.rd(0x58), g_codec.rd(0x49));
 }
@@ -651,6 +682,24 @@ static void jack_task(void *)
                 }
                 g_prebuf = true;
             }
+            // ── 클럭 드리프트 보정.
+            //
+            // 싱크로 들어오는 소리는 **맥의 클럭**으로, 잭으로 나가는 소리는 **우리
+            // I2S 클럭**으로 흐른다. 둘이 100ppm 만 어긋나도 링이 서서히 한쪽으로
+            // 쏠려서, 결국 꽉 차 버리거나(버림) 굶는다(무음) — 그 순간이 "딱" 소리다.
+            //
+            // 목표 수위를 정해 두고, 벗어나면 블록당 **한 프레임**을 건너뛰거나
+            // 겹쳐 넣어 되돌린다. 0.4% 의 순간적 속도 보정인데 어긋남이 해소되면
+            // 바로 멈추므로 들리지 않는다. 무음 구간을 끼워 넣는 것보다 훨씬 낫다.
+            const size_t target = RING_SZ / 4;          // 약 370ms
+            const size_t slack  = RING_SZ / 8;
+            int drift = 0;
+            if (g_role == ROLE_SINK) {
+                const size_t u = ring_used();
+                if (u > target + slack)                 drift = +1;   // 남는다 → 한 프레임 버린다
+                else if (u + slack < target && u > want + 8) drift = -1; // 모자란다 → 한 프레임 겹친다
+            }
+
             size_t have = ring_used();
             have -= have % 4;
             if (have < want) {                  // 굶었다 — 무음을 내고 다시 채운다
@@ -663,10 +712,13 @@ static void jack_task(void *)
                 continue;
             }
             size_t rd = g_rd;
+            if (drift > 0) { rd += 4; g_drift_skip++; }      // 한 프레임 버리고 시작
             for (size_t b = 0; b < want; b += 2) {           // 풀스케일로 그대로 넘긴다
                 memcpy((uint8_t *)g_i2s_buf + b, &g_ring[rd & RING_MASK], 2);
                 rd += 2;
+                if (drift < 0 && b == 0) { rd -= 2; }        // 첫 샘플을 한 번 겹친다
             }
+            if (drift < 0) { g_drift_dup++; }
             g_rd = rd & RING_MASK;
         } else {
             memset(g_i2s_buf, 0, (size_t)I2S_BLOCK * 4);
@@ -760,22 +812,71 @@ static const char *SD_REC_DIR = "/REC";
 // 마이크 게인 프리셋. 낮음 → 높음.
 static const uint16_t MIC_VOLS[] = {0x8080, 0xa0a0, 0xb0b0, 0xc0c0};
 static volatile bool     g_rec = false;
+static volatile bool     g_rec_nc = false;      // 2마이크 잡음제거로 모노 녹음
 static volatile uint32_t g_rec_bytes = 0;
 static volatile float    g_rec_lvl_l = 0, g_rec_lvl_r = 0;
 static String            g_rec_name;
 static File              g_rec_file;
 
-// 44바이트 표준 WAV 헤더. 길이는 0 으로 써 두고 끝낼 때 되돌아가 채운다.
-static void wav_header(File &f, uint32_t data_bytes)
+// ── 2마이크 적응 잡음제거 (NLMS).
+//
+// 진짜 ANC(역위상을 이어폰에 되먹임)는 이 하드웨어로 불가능하다 — 루프 지연이
+// 1ms 미만이어야 하는데 I2S DMA 만 수 ms 다. 대신 **녹음에서는 된다**:
+// 마이크가 두 개니까 한쪽을 목표(primary), 다른 쪽을 잡음 기준(reference)으로 두고
+// 상관된 성분을 적응적으로 빼면 배경 잡음이 줄고 가까운 소리가 남는다.
+//
+// 탭을 여러 개 두는 이유는 두 마이크 사이의 도달 시간차·위상차를 필터가 스스로
+// 맞춰야 하기 때문이다. NLMS 는 입력 세기로 정규화해 발산을 막는다.
+static const int NC_TAPS = 12;
+static float g_nc_w[NC_TAPS];
+static float g_nc_ref[NC_TAPS];
+static float g_hp_xl = 0, g_hp_yl = 0, g_hp_xr = 0, g_hp_yr = 0;
+
+static void nc_reset()
 {
-    const uint32_t rate = OUT_HZ, ch = 2, bits = 16;
+    for (int i = 0; i < NC_TAPS; i++) { g_nc_w[i] = 0; g_nc_ref[i] = 0; }
+    g_hp_xl = g_hp_yl = g_hp_xr = g_hp_yr = 0;
+}
+
+// DC 차단 1차 고역통과. 일렉트릿 마이크는 DC 오프셋이 있어서 그냥 두면 그게
+// 헤드룸을 먹고 필터도 흔든다.
+static inline float hp(float x, float &xp, float &yp)
+{
+    const float y = x - xp + 0.995f * yp;
+    xp = x; yp = y;
+    return y;
+}
+
+static inline int16_t nc_step(int16_t l, int16_t r)
+{
+    const float pri = hp((float)l, g_hp_xl, g_hp_yl);
+    const float ref = hp((float)r, g_hp_xr, g_hp_yr);
+
+    for (int i = NC_TAPS - 1; i > 0; i--) g_nc_ref[i] = g_nc_ref[i - 1];
+    g_nc_ref[0] = ref;
+
+    float y = 0, p = 1e-6f;
+    for (int i = 0; i < NC_TAPS; i++) { y += g_nc_w[i] * g_nc_ref[i]; p += g_nc_ref[i] * g_nc_ref[i]; }
+    const float e = pri - y;                       // 잡음을 뺀 나머지 = 우리가 원하는 것
+    const float mu = 0.10f;                        // 수렴 속도. 너무 크면 발산한다
+    const float g = mu * e / p;
+    for (int i = 0; i < NC_TAPS; i++) g_nc_w[i] += g * g_nc_ref[i];
+
+    const int v = (int)e;
+    return (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+}
+
+// 44바이트 표준 WAV 헤더. 길이는 0 으로 써 두고 끝낼 때 되돌아가 채운다.
+static void wav_header(File &f, uint32_t data_bytes, uint32_t ch)
+{
+    const uint32_t rate = OUT_HZ, bits = 16;
     const uint32_t byte_rate = rate * ch * bits / 8;
     uint8_t h[44];
     memcpy(h, "RIFF", 4);
     const uint32_t riff = 36 + data_bytes;  memcpy(h + 4, &riff, 4);
     memcpy(h + 8, "WAVEfmt ", 8);
     const uint32_t fmt_len = 16;            memcpy(h + 16, &fmt_len, 4);
-    const uint16_t pcm = 1, chn = ch;       memcpy(h + 20, &pcm, 2); memcpy(h + 22, &chn, 2);
+    const uint16_t pcm = 1, chn = (uint16_t)ch; memcpy(h + 20, &pcm, 2); memcpy(h + 22, &chn, 2);
     memcpy(h + 24, &rate, 4);               memcpy(h + 28, &byte_rate, 4);
     const uint16_t align = ch * bits / 8, bps = bits;
     memcpy(h + 32, &align, 2);              memcpy(h + 34, &bps, 2);
@@ -798,15 +899,17 @@ static bool rec_start()
 
     xSemaphoreTake(g_fsmux, portMAX_DELAY);
     g_rec_file = SD_MMC.open(nm, FILE_WRITE);
-    if (g_rec_file) wav_header(g_rec_file, 0);
+    if (g_rec_file) wav_header(g_rec_file, 0, g_rec_nc ? 1 : 2);
     xSemaphoreGive(g_fsmux);
     if (!g_rec_file) { Serial.printf("[녹음] %s 열기 실패\n", nm); return false; }
 
     g_rec_name = String(nm);
     g_rec_bytes = 0;
     g_rec_peak = 0;
+    nc_reset();
     g_rec = true;
-    Serial.printf("[녹음] ● %s 시작 (44.1kHz 16bit 2ch, 176KB/s)\n", nm);
+    Serial.printf("[녹음] ● %s 시작 (44.1kHz 16bit %s)\n", nm,
+                  g_rec_nc ? "1ch, 2마이크 잡음제거 켬, 88KB/s" : "2ch, 176KB/s");
     return true;
 }
 
@@ -820,12 +923,13 @@ static void rec_stop()
         // 헤더의 길이 두 곳을 되돌아가 채운다. 안 하면 재생기가 길이를 모른다.
         const uint32_t n = g_rec_bytes;
         g_rec_file.seek(0);
-        wav_header(g_rec_file, n);
+        wav_header(g_rec_file, n, g_rec_nc ? 1 : 2);
         g_rec_file.close();
     }
     xSemaphoreGive(g_fsmux);
     Serial.printf("[녹음] ■ %s (%u KB, %.1f초)\n", g_rec_name.c_str(),
-                  (unsigned)(g_rec_bytes / 1024), g_rec_bytes / (float)(OUT_HZ * 4));
+                  (unsigned)(g_rec_bytes / 1024),
+                  g_rec_bytes / (float)(OUT_HZ * (g_rec_nc ? 2 : 4)));
     lib_rescan();
 }
 
@@ -855,10 +959,20 @@ static void rec_task(void *)
             g_rec_lvl_r = (float)sqrt(er / frames);
         }
 
+        // 잡음제거를 켰으면 스테레오를 모노 한 채널로 바꿔 쓴다(용량도 절반).
+        size_t out_bytes = got;
+        uint8_t *out = (uint8_t *)buf;
+        static int16_t mono[512];
+        if (g_rec_nc) {
+            for (int i = 0; i < frames; i++) mono[i] = nc_step(buf[2 * i], buf[2 * i + 1]);
+            out = (uint8_t *)mono;
+            out_bytes = (size_t)frames * 2;
+        }
+
         xSemaphoreTake(g_fsmux, portMAX_DELAY);
-        const size_t w = g_rec_file ? g_rec_file.write((uint8_t *)buf, got) : 0;
+        const size_t w = g_rec_file ? g_rec_file.write(out, out_bytes) : 0;
         xSemaphoreGive(g_fsmux);
-        if (w != got) { Serial.println("[녹음] 쓰기 실패 — 중단"); g_rec = false; }
+        if (w != out_bytes) { Serial.println("[녹음] 쓰기 실패 — 중단"); g_rec = false; }
         g_rec_bytes += w;
     }
 }
@@ -1049,11 +1163,7 @@ static void cmd_vol(int v)
     g_vol = constrain(v, 0, 100);
     g_prefs.putInt("vol", g_vol);
     // 잭은 코덱의 아날로그 볼륨으로 내린다(0~63). 디지털로 깎으면 노이즈가 된다.
-    if (g_codec_ok) {
-        const uint8_t hv = (uint8_t)((g_vol * 63) / 100);
-        g_codec.SetVolumeHeadphone(hv);
-        g_codec.SetVolumeSpeaker(hv);
-    }
+    apply_codec_volume();
 }
 
 static void cmd_out(OutMode m)
@@ -1118,12 +1228,15 @@ static void api_status()
     j += "\"recpeak\":"; j += String((int)g_rec_peak); j += ",";
     j += "\"micvol\":\""; { char b[10]; snprintf(b, sizeof b, "0x%04X", g_mic_vol); j += b; } j += "\",";
     j += "\"rec\":"; j += g_rec ? "true," : "false,";
-    j += "\"recsec\":"; j += String(g_rec_bytes / (float)(OUT_HZ * 4), 1); j += ",";
+    j += "\"recsec\":"; j += String(g_rec_bytes / (float)(OUT_HZ * (g_rec_nc ? 2 : 4)), 1); j += ",";
+    j += "\"recnc\":"; j += g_rec_nc ? "true," : "false,";
     j += "\"reclvl\":["; j += String((int)g_rec_lvl_l) + "," + String((int)g_rec_lvl_r); j += "],";
     j += "\"recname\":\""; j += json_escape(g_rec_name); j += "\",";
     j += "\"role\":\""; j += (g_role == ROLE_SINK ? "sink" : "player"); j += "\",";
     j += "\"sinkhz\":"; j += String((int)g_sink_hz); j += ",";
     j += "\"sinkkb\":"; j += String((unsigned)(g_sink_bytes / 1024)); j += ",";
+    j += "\"dskip\":"; j += String((unsigned)g_drift_skip); j += ",";
+    j += "\"ddup\":"; j += String((unsigned)g_drift_dup); j += ",";
     j += "\"starve\":"; j += String((unsigned)g_starves); j += ",";
     j += "\"sinkdrop\":"; j += String((unsigned)g_sink_drops); j += ",";
     j += "\"out\":\""; j += (g_out == OUT_JACK ? "jack" : "bt"); j += "\",";
@@ -1389,6 +1502,7 @@ static void http_setup()
     g_http.on("/api/rec", HTTP_POST, [] {
         const bool on = (g_http.arg("on") == "1");
         if (on) {
+            g_rec_nc = (g_http.arg("nc") == "1");
             const bool ok = rec_start();
             g_http.send(ok ? 200 : 503, "text/plain",
                         ok ? "녹음 시작" : (g_have_sd ? "시작 실패" : "SD 가 없다(플래시는 5초뿐)"));
@@ -1591,6 +1705,9 @@ void setup()
     g_out = (OutMode)g_prefs.getInt("out", (int)OUT_BT);
     g_role = (Role)g_prefs.getInt("role", (int)ROLE_PLAYER);
     g_mic_vol = (uint16_t)g_prefs.getInt("micvol", 0xa0a0);
+    // 싱크는 기본 볼륨을 높게 둔다. 디지털은 풀스케일로 흘리고 크기는 아날로그와
+    // 맥의 AVRCP 볼륨으로 조절하는 것이 잡음이 가장 적다.
+    if (g_role == ROLE_SINK) g_vol = g_prefs.getInt("vol", 85);
 
     // 큰 버퍼는 전부 PSRAM 으로. 내부 DRAM 은 BT+WiFi 스택에 남겨야 한다.
     if (!psramFound()) Serial.println("[mem] PSRAM 이 안 보인다 — PSRAM=enabled 로 빌드했는지 확인");
@@ -1664,10 +1781,10 @@ void loop()
         static uint32_t last_stat = 0;
         if (g_bt_stream && millis() - last_stat > 3000) {
             last_stat = millis();
-            Serial.printf("[싱크] 수신 %u KB · 버림 %u · 굶음 %u · 링 %u%% · 힙 %u\n",
+            Serial.printf("[싱크] 수신 %u KB · 버림 %u · 굶음 %u · 드리프트 -%u/+%u · 링 %u%% · 힙 %u\n",
                           (unsigned)(g_sink_bytes / 1024), (unsigned)g_sink_drops,
-                          (unsigned)g_starves, (unsigned)(ring_used() * 100 / RING_SZ),
-                          (unsigned)ESP.getFreeHeap());
+                          (unsigned)g_starves, (unsigned)g_drift_skip, (unsigned)g_drift_dup,
+                          (unsigned)(ring_used() * 100 / RING_SZ), (unsigned)ESP.getFreeHeap());
         }
     }
 

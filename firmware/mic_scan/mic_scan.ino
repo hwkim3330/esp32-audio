@@ -205,7 +205,71 @@ void setup()
     Serial.println("   4핀 이어폰의 마이크는 이 보드에서 배선되지 않았다는 뜻이다.");
     Serial.println(" - 0x2020 보다 훨씬 큰 검파값을 내는 비트가 있으면 → 그게 헤드셋 마이크다");
     Serial.println("   (이어폰 하우징 안에 있으니 자기 소리를 압도적으로 크게 듣는다).");
-    Serial.println("완료. 이후 온보드 마이크 RMS 를 계속 찍는다 — 말해 보면 값이 올라간다.");
+    scan2d();
+    Serial.println("완료. 이후 무음 상태 소스별 RMS 를 반복해 찍는다.");
+}
+
+// ── 2차 스캔: 입력 소스 × 아날로그 경로(바이어스)를 2차원으로 쓴다.
+//
+// 1차 스캔에 구멍이 두 개 있었다:
+//   (1) ADC_SRC 비트 7(0x8080)을 재보지 않았다.
+//   (2) ADC_APC_CTRL(0x50)을 전혀 건드리지 않았다. 헤드셋 마이크는 전용 바이어스를
+//       받아야 소리를 내는데, 꺼져 있으면 배선돼 있어도 바닥으로 읽힌다.
+//
+// 8월에 이 레지스터를 9가지 쓸어본 기록이 있지만 그건 LRCK/DOUT 이 뒤바뀐 상태에서
+// 나온 것이라 전부 무효다. 다시 쓴다.
+//
+// 판정 기준은 무음에서의 RMS — 방의 소리를 듣는가. 톤을 내면서 재면 코덱 내부
+// 루프백(0x0101/0x0202)에 속는다.
+static void scan2d()
+{
+    static const uint16_t apcs[] = {
+        0xbbc3, 0xffc3, 0xbbcf, 0xffcf, 0xbbf3, 0xfff3, 0xffff,
+        0xbbe3, 0xbfc3, 0x3bc3, 0x7bc3,
+    };
+    // 온보드로 확정된 비트(0x4040 좌 / 0x1010 우 / 0x2020 둘)는 빼고 나머지만 본다.
+    static const uint16_t srcs[] = {0x8080, 0x0808, 0x0404, 0x0101, 0x0202};
+
+    Serial.println("\n[2차 스캔] 무음 RMS (L/R) — 소스 x 아날로그 경로");
+    Serial.print("  APC        ");
+    for (unsigned j = 0; j < sizeof srcs / sizeof *srcs; j++) Serial.printf("   %04X     ", srcs[j]);
+    Serial.println();
+
+    double best = 0; uint16_t best_apc = 0, best_src = 0;
+    for (unsigned i = 0; i < sizeof apcs / sizeof *apcs; i++) {
+        codec.wr(R_ADC_APC, apcs[i]);
+        Serial.printf("  0x%04X  ", apcs[i]);
+        double row_min = 1e9, row_max = 0;
+        for (unsigned j = 0; j < sizeof srcs / sizeof *srcs; j++) {
+            codec.wr(R_ADC_SRC, srcs[j]);
+            delay(90);
+            const meas_t m = measure(1000.0f, 0.0f, 260);
+            Serial.printf(" %5.0f/%-5.0f", m.rms_l, m.rms_r);
+            const double v = m.rms_l > m.rms_r ? m.rms_l : m.rms_r;
+            if (v < row_min) row_min = v;
+            if (v > row_max) row_max = v;
+            // 후보 판정은 아래에서 행 단위로 걸러 넣는다
+            if (v > best && v < 25000) { best = v; best_apc = apcs[i]; best_src = srcs[j]; }
+        }
+        // **포화(레일) 걸러내기.** 실측에서 APC=0x3BC3/0x7BC3 이 소스와 무관하게 R 을
+        // 30000 으로 railed 시켰고, 처음 판정 로직이 그걸 "마이크" 로 잡아 오탐했다.
+        // 마이크라면 소스를 바꾸면 값이 달라진다 — 행 안에서 변화가 없고 값이 크면
+        // 그건 포화다.
+        if (row_max > 25000 && row_min > 25000 * 0.8) Serial.print("   <- 포화(레일), 무시");
+        Serial.println();
+    }
+    codec.wr(R_ADC_APC, 0xbbc3);
+    codec.wr(R_ADC_SRC, 0x2020);
+
+    Serial.println("\n  == 2차 판정 ==");
+    Serial.printf("  온보드 아닌 소스 중 최고: APC=0x%04X SRC=0x%04X -> RMS %.0f\n",
+                  best_apc, best_src, best);
+    // 온보드 마이크의 무음 RMS 가 500~700 이다. 다른 입력이 배선돼 있다면 같은
+    // 자릿수여야 한다. 25000 이상은 포화라 후보에서 이미 뺐다.
+    if (best > 150)
+        Serial.println("  <- 방의 소리를 듣는 다른 입력이 있다. 이 조합을 쓰면 된다.");
+    else
+        Serial.println("  <- 전부 바닥이다(온보드 마이크는 500~700). 배선된 입력은 온보드 2개뿐.");
 }
 
 // ── 결정적 판정: **무음으로 두고** 각 소스의 RMS 를 잰다.
