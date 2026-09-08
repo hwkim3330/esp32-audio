@@ -30,7 +30,8 @@ static const int SR = 44100;                 // 44100 고정. 바꾸면 AC101 PL
 static const i2s_port_t PORT = I2S_NUM_0;
 static const int BLOCK = 256;                // 프레임
 
-static const int PIN_MCLK = 0, PIN_BCLK = 27, PIN_LRCK = 25, PIN_DOUT = 26;
+// ★ 정정(2026-09-08): LRCK/DOUT 이 25/26 으로 뒤바뀌어 있었다(arduino-audiokit 기준).
+static const int PIN_MCLK = 0, PIN_BCLK = 27, PIN_LRCK = 26, PIN_DOUT = 25;
 static const int PIN_SDA = 33, PIN_SCL = 32;
 
 // 실기로 확정된 키 매핑. 한때 두 칸 밀려 있어서 "3번만 반응한다" 로 보였다.

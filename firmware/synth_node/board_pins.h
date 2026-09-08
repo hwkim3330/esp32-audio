@@ -25,8 +25,17 @@
 //    공유하므로 전이중(full-duplex) 로 열어야 한다 — 재생 중에도 듣기 위해.
 #define CN_PIN_I2S_MCLK      0
 #define CN_PIN_I2S_BCLK     27
-#define CN_PIN_I2S_LRCK     25
-#define CN_PIN_I2S_DOUT     26     // ESP32 → 코덱 (스피커)
+// ★ 2026-09-08 정정: LRCK 와 DOUT 이 서로 뒤바뀌어 있었다.
+//
+//    이 저장소의 오디오 결론 전부("I2S 가 정확히 0", "오디오는 죽었다")가 이 상태에서
+//    나왔다. 워드싱크를 데이터 라인으로, 데이터를 싱크 라인으로 보내면 클럭은 다 흐르고
+//    I2C 도 완벽한데 오디오만 안 흐른다 — 관측된 증상과 정확히 일치한다.
+//
+//    근거: pschatzmann/arduino-audiokit 의 이 보드(AI-Thinker AC101) 정의.
+//    그 라이브러리는 이 보드에서 동작이 확인된 것이다.
+//      PIN_I2S_AUDIO_KIT_WS 26 / PIN_I2S_AUDIO_KIT_DATA_OUT 25 / DATA_IN 35
+#define CN_PIN_I2S_LRCK     26
+#define CN_PIN_I2S_DOUT     25     // ESP32 → 코덱
 // DIN = GPIO35. 공개 보드 정의와 같다.
 //
 // 한때 GPIO34 로 정정했다가 되돌렸다. GPIO34 가 "피크 63" 을 내서 신호로 봤지만,
@@ -37,10 +46,15 @@
 #define CN_PIN_I2S_DIN      35     // 코덱 → ESP32 (마이크)
 
 // ── 파워앰프 인에이블 (가정)
-//    공장 펌웨어 부팅 로그에서 GPIO22 를 출력으로 구동하는 것이 관측됐다:
-//      "GPIO[22]| InputEn: 0| OutputEn: 1"
-//    이게 앰프 인에이블일 가능성이 높다. 다른 리비전은 GPIO21 을 쓴다.
-#define CN_PIN_PA_ENABLE    22
+//    ★ 정정: 앰프 인에이블은 GPIO21 이다. GPIO22 는 초록 LED 다.
+//    공장 펌웨어가 GPIO22 를 출력으로 구동한 것("GPIO[22]| OutputEn: 1")은 LED 였다.
+//    근거는 위와 같다(arduino-audiokit 의 AI-Thinker AC101 보드 정의):
+//      PA_ENABLE_GPIO 21 / GREEN_LED_GPIO 22 / BLUE_LED_GPIO 19 / HEADPHONE_DETECT 5
+//    GPIO5 는 KEY6 과 겸용이다 — 이어폰을 꽂으면 그 핀이 눌린 것처럼 읽힌다.
+#define CN_PIN_PA_ENABLE    21
+#define CN_PIN_LED_GREEN    22
+#define CN_PIN_LED_BLUE     19
+#define CN_PIN_HP_DETECT     5
 
 // ── 터치/버튼 6개 (가정)
 //    공장 펌웨어는 이들을 "정전식 터치" 로 초기화했다(Touch_Pad 심볼).

@@ -290,7 +290,9 @@ void loop()
     if (alive && !ever_alive) {
         ever_alive = true;
         Serial.println("\n***********************************************");
-        Serial.println("*** 오디오가 살아났다! DIP 스위치가 원인이었다 ***");
+        // 한때 이 자리에 "DIP 스위치가 원인이었다" 고 찍었다. 틀렸다 —
+        // 원인은 board_pins.h 의 LRCK/DOUT 이 서로 뒤바뀐 것이었다(25 ↔ 26).
+        Serial.println("*** 오디오가 살아났다! LRCK/DOUT 핀 뒤바뀜이 원인이었다 ***");
         Serial.println("***********************************************");
     }
     Serial.printf("[%4lu] 검파 L %7.2f R %7.2f  RMS L %6.1f R %6.1f  %s\n",

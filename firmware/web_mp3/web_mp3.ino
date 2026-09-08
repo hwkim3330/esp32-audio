@@ -62,10 +62,17 @@ static const int KEY_BT   = 5;    // KEY6
 // GPIO22/21 은 **파워앰프 인에이블 후보**다. 이 저장소는 22 를 "PA_ENABLE(가정)" 으로
 // 적어 두고도(loopback_test/board_pins.h) 동시에 상태 LED 로 깜빡여 왔다. 22 가 정말
 // 앰프 인에이블이면 그 깜빡임이 **청음 시험 내내 앰프를 켜고 끄는 짓**이다.
-// 리비전에 따라 21 을 쓰기도 하므로 **둘 다 계속 HIGH 로 잡아 둔다.** 깜빡이지 않는다.
-// (키를 읽기 전에 이 핀들을 먼저 설정해야 GPIO13 이 GPIO22 에 끌리지 않는다.)
-static const int PIN_PA_A = 22;
-static const int PIN_PA_B = 21;
+// ★ 확정(2026-09-08): **앰프 인에이블은 GPIO21, GPIO22 는 초록 LED** 다.
+// 근거 둘: arduino-audiokit 의 이 보드 정의(PA_ENABLE_GPIO 21 / GREEN_LED_GPIO 22),
+// 그리고 실측 — loopback_test 에서 GPIO22 를 LOW/HIGH 로 바꿔도 출력 검파값이
+// 그대로였다(비 0.85). 둘 다 HIGH 로 두면 앰프는 켜지고 LED 는 그냥 켜져 있다.
+static const int PIN_PA    = 21;   // 파워앰프 인에이블
+static const int PIN_LED_G = 22;   // 초록 LED (앰프가 아니다)
+
+// GPIO5 는 **헤드폰 삽입 검출과 KEY6 겸용**이다(arduino-audiokit: HEADPHONE_DETECT 5).
+// 이어폰을 꽂으면 이 핀이 계속 LOW 로 읽혀서 KEY6 이 눌린 것처럼 보인다 — 그래서
+// KEY6 의 길게 누르기 동작(BT 탐색)은 웹 UI 로만 두고 여기서는 검출로 쓴다.
+static const int PIN_HP_DETECT = 5;
 
 static const int SD_CLK = 14, SD_CMD = 15, SD_D0 = 2;   // SDMMC 슬롯1, 1비트 모드
 
@@ -78,7 +85,10 @@ static const int OUT_HZ = 44100;   // A2DP 표준. 여기로 맞춰 리샘플한
 // 잭 출력(AC101 + I2S). 44100 을 벗어나면 AC101 PLL 이 락을 잃는다 — 우연히
 // A2DP 와 같은 레이트라 리샘플러 하나로 두 출력을 다 먹인다.
 static const i2s_port_t I2S_PORT_JACK = I2S_NUM_0;
-static const int PIN_MCLK = 0, PIN_BCLK = 27, PIN_LRCK = 25, PIN_DOUT = 26;
+// ★ 정정(2026-09-08): LRCK 와 DOUT 이 25/26 으로 뒤바뀌어 있었다. 이 한 쌍 때문에
+// 이 저장소의 "오디오는 죽었다" 결론 전체가 틀렸다. 근거는 arduino-audiokit 의
+// 이 보드 정의(WS 26 / DATA_OUT 25 / DATA_IN 35)와 고친 뒤의 실측이다.
+static const int PIN_MCLK = 0, PIN_BCLK = 27, PIN_LRCK = 26, PIN_DOUT = 25;
 static const int PIN_SDA = 33, PIN_SCL = 32;
 static const int I2S_BLOCK = 256;   // 프레임
 
@@ -744,6 +754,7 @@ static void api_status()
     j += "\"under\":"; j += String((unsigned)g_underruns); j += ",";
     j += "\"heap\":"; j += String((unsigned)ESP.getFreeHeap()); j += ",";
     j += "\"out\":\""; j += (g_out == OUT_JACK ? "jack" : "bt"); j += "\",";
+    j += "\"hp\":"; j += (digitalRead(PIN_HP_DETECT) == LOW) ? "true," : "false,";
     j += "\"jackok\":"; j += g_codec_ok ? "true," : "false,";
     j += "\"tone\":"; j += ((int32_t)(g_tone_until - millis()) > 0) ? "true," : "false,";
     j += "\"i2sframes\":"; j += String((unsigned long)(g_i2s_frames & 0xFFFFFFFF)); j += ",";
@@ -1006,8 +1017,8 @@ static void http_setup()
         static const uint8_t regs[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0C, 0x10, 0x11,
                                        0x40, 0x41, 0x44, 0x45, 0x46, 0x48, 0x49, 0x4C, 0x4D,
                                        0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x58};
-        String j = "{\"pa22\":" + String(digitalRead(PIN_PA_A)) +
-                   ",\"pa21\":" + String(digitalRead(PIN_PA_B)) + ",\"regs\":{";
+        String j = "{\"pa22\":" + String(digitalRead(PIN_LED_G)) +
+                   ",\"pa21\":" + String(digitalRead(PIN_PA)) + ",\"regs\":{";
         for (unsigned i = 0; i < sizeof regs; i++) {
             if (i) j += ",";
             char b[24];
@@ -1048,12 +1059,12 @@ static Key g_keys[] = {
 
 static void keys_setup()
 {
-    // 앰프 인에이블 후보 두 개를 먼저 HIGH 로 못박는다. GPIO13(KEY2)이 GPIO22 에 끌리는
-    // 문제도 이걸로 같이 해결된다(핀을 먼저 구동해 두면 읽기가 안정된다).
-    pinMode(PIN_PA_A, OUTPUT);
-    pinMode(PIN_PA_B, OUTPUT);
-    digitalWrite(PIN_PA_A, HIGH);
-    digitalWrite(PIN_PA_B, HIGH);
+    // 앰프와 LED 를 키보다 먼저 구동한다. GPIO13(KEY2)이 GPIO22 에 끌리는 문제도
+    // 이걸로 같이 해결된다(핀을 먼저 구동해 두면 읽기가 안정된다).
+    pinMode(PIN_PA, OUTPUT);
+    pinMode(PIN_LED_G, OUTPUT);
+    digitalWrite(PIN_PA, HIGH);      // 파워앰프 켠다
+    digitalWrite(PIN_LED_G, HIGH);   // 전원 표시로 그냥 켜 둔다(깜빡이지 않는다)
     for (auto &k : g_keys) pinMode(k.pin, k.pin == 36 ? INPUT : INPUT_PULLUP);   // 36 은 입력 전용(내부 풀업 없음)
 }
 
@@ -1076,8 +1087,9 @@ static void keys_poll()
             Serial.printf("[key] GPIO%d\n", k.pin);
         } else if (!lvl && !k.longsent && now - k.down_at > 1200) {
             k.longsent = true;
-            if (k.pin == KEY_BT) { Serial.println("[key] BT 탐색"); bt_scan_start(); }
-            else if (k.pin == KEY_PLAY) { cmd_stop(); }
+            // KEY6(GPIO5)은 헤드폰 검출 겸용이라 이어폰을 꽂으면 계속 LOW 다.
+            // 길게 누르기로 BT 탐색을 걸면 꽂는 순간 오발화한다 — 웹 UI 로만 둔다.
+            if (k.pin == KEY_PLAY) { cmd_stop(); }
             else if (k.pin == KEY_VUP) {                  // 테스트음 5초 — 잭이 사는지 귀로 본다
                 g_tone_until = millis() + 5000;
                 Serial.println("[key] 잭 테스트음 5초");
