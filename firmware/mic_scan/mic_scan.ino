@@ -208,10 +208,26 @@ void setup()
     Serial.println("완료. 이후 온보드 마이크 RMS 를 계속 찍는다 — 말해 보면 값이 올라간다.");
 }
 
+// ── 결정적 판정: **무음으로 두고** 각 소스의 RMS 를 잰다.
+//
+// 톤을 내면서 잰 값만으로는 "마이크가 그 소리를 들었다" 와 "코덱 내부에서 출력이
+// 입력으로 되먹임됐다(전기적 루프백)" 를 구분할 수 없다. 둘 다 큰 검파값을 낸다.
+//
+// 무음으로 두면 갈린다:
+//   진짜 마이크   → 방의 소리를 듣는다. RMS 가 바닥보다 확실히 높다.
+//   전기적 루프백 → 낼 소리가 없으니 바닥에 붙는다.
 void loop()
 {
+    static const uint16_t srcs[] = {0x2020, 0x0101, 0x0202, 0x1010, 0x4040, 0x0000};
     static uint32_t k = 0;
-    const meas_t m = measure(1000.0f, 0.0f, 400);   // 무음으로 두고 듣기만
-    Serial.printf("[%4u] 온보드 마이크 RMS L %8.1f  R %8.1f\n", ++k, m.rms_l, m.rms_r);
-    delay(200);
+    Serial.printf("\n[%u] 무음 상태에서 각 소스가 방의 소리를 듣는가\n", ++k);
+    for (unsigned i = 0; i < sizeof srcs / sizeof *srcs; i++) {
+        codec.wr(R_ADC_SRC, srcs[i]);
+        delay(120);
+        const meas_t m = measure(1000.0f, 0.0f, 400);   // 무음
+        Serial.printf("  0x%04X  RMS L %8.1f  R %8.1f  %s\n", srcs[i], m.rms_l, m.rms_r,
+                      (m.rms_l > 100 || m.rms_r > 100) ? "← 방의 소리를 듣는다(진짜 마이크)"
+                                                       : "← 바닥 (마이크 아님)");
+    }
+    delay(500);
 }

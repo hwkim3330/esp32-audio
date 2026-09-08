@@ -93,6 +93,15 @@ static const int PIN_MCLK = 0, PIN_BCLK = 27, PIN_LRCK = 26, PIN_DOUT = 25;
 static const int PIN_SDA = 33, PIN_SCL = 32;
 static const int I2S_BLOCK = 256;   // 프레임
 
+// SD 쓰기는 **/MP3 폴더 안에서만** 허용한다.
+//
+// 이 카드에는 GoPro 영상이 들어 있었다(1.9GB, 2026-09-08 백업·검증 완료). 그래서
+// 처음에는 SD 쓰기 경로를 아예 만들지 않았다. 이제 곡을 SD 에 넣으라는 요청이
+// 있어서 열되, **DCIM/MISC/System Volume Information 은 손댈 수 없게** 경로를
+// /MP3 로 못박는다. 삭제도 이 폴더 안에서만 된다. 곡 스캔도 이 폴더만 본다
+// (루트를 훑으면 DCIM 의 영상 수천 개를 헛돈다).
+static const char *SD_MUSIC_DIR = "/MP3";
+
 // ─────────────────────────────────────────────────────────────── 링버퍼 (PSRAM)
 
 // 2의 거듭제곱으로 잡아 마스킹으로 감싼다. 256KB = 스테레오 16비트 44.1kHz 로 약 1.48초.
@@ -420,8 +429,20 @@ static void gap_cb(esp_bt_gap_cb_event_t ev, esp_bt_gap_cb_param_t *p)
     }
 }
 
+static bool g_bt_up = false;
+
 static void bt_setup()
 {
+    // 잭으로만 들을 거면 블루투스를 아예 올리지 않는다.
+    //
+    // Bluedroid + 클래식 BT 는 내부 DRAM 을 60~70KB 쥔다. SD 를 마운트한 플레이어
+    // 모드에서 BT 까지 올리면 남는 힙이 11KB 까지 떨어지는데, 이 보드에서 그 수준은
+    // 실제로 죽는다(파일 열기에서 할당 실패). 필요할 때만 올린다 —
+    // 출력을 BT 로 바꾸면 cmd_out() 이 재부팅한다.
+    if (g_role == ROLE_PLAYER && g_out != OUT_BT) {
+        Serial.println("[bt] 잭 모드 — 블루투스를 올리지 않는다(내부 DRAM 60~70KB 절약)");
+        return;
+    }
     // BLE 몫의 컨트롤러 메모리를 반납한다. 이 펌웨어는 클래식 BT(A2DP)만 쓰는데
     // 안 반납하면 내부 DRAM 을 30~40KB 쥐고 앉아 있다. 실측으로 이게 결정적이었다 —
     // 반납 전에는 초기화가 끝난 뒤 남는 힙이 14KB 였고 재생을 걸면 죽었다.
@@ -473,6 +494,7 @@ static void bt_setup()
     }
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
+    g_bt_up = true;
     const uint8_t *mac = esp_bt_dev_get_address();
     Serial.printf("[bt] 준비됨, MAC %02x:%02x:%02x:%02x:%02x:%02x, 이름 %s\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], BT_NAME);
@@ -676,7 +698,8 @@ static void lib_rescan()
 {
     xSemaphoreTake(g_fsmux, portMAX_DELAY);
     g_lib.clear();
-    if (g_have_sd) scan_dir(SD_MMC, "/", true, 1);
+    // SD 는 /MP3 만 본다. 루트를 훑으면 DCIM 의 영상 수천 개를 헛돈다.
+    if (g_have_sd && SD_MMC.exists(SD_MUSIC_DIR)) scan_dir(SD_MMC, SD_MUSIC_DIR, true, 1);
     scan_dir(LittleFS, "/", false, 1);
     xSemaphoreGive(g_fsmux);
     Serial.printf("[lib] 곡 %d개 (SD %s)\n", (int)g_lib.size(), g_have_sd ? "있음" : "없음");
@@ -901,6 +924,13 @@ static void cmd_vol(int v)
 static void cmd_out(OutMode m)
 {
     if (m == g_out) return;
+    // BT 로 내보내려는데 스택이 안 올라와 있으면(잭 모드로 부팅했을 때) 재부팅한다.
+    if (m == OUT_BT && !g_bt_up) {
+        g_prefs.putInt("out", (int)OUT_BT);
+        Serial.println("[출력] 블루투스로 전환 — 스택을 올리려면 재부팅한다");
+        delay(200);
+        ESP.restart();
+    }
     // A2DP 스트림을 먼저 접는다. 안 접으면 이어폰 쪽이 무음 스트림을 계속 받는다.
     if (g_out == OUT_BT && g_bt_stream) esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
     g_out = m;
@@ -976,7 +1006,8 @@ static void api_status()
 
     j += "\"bt\":{";
     j += "\"state\":\"";
-    j += g_bt_stream ? "스트리밍" : (g_bt_conn ? "연결됨(대기)" : (g_bt_scanning ? "탐색 중" : "미연결"));
+    j += !g_bt_up ? "미사용(잭 모드)"
+       : g_bt_stream ? "스트리밍" : (g_bt_conn ? "연결됨(대기)" : (g_bt_scanning ? "탐색 중" : "미연결"));
     j += "\",";
     j += "\"connected\":"; j += g_bt_conn ? "true," : "false,";
     j += "\"streaming\":"; j += g_bt_stream ? "true," : "false,";
@@ -1098,6 +1129,14 @@ static void api_sd_get()
 static File g_up;
 static String g_up_err;
 
+static bool sd_music_path(const String &name, String &out)
+{
+    String n = name.substring(name.lastIndexOf('/') + 1);   // 디렉터리 성분 제거
+    if (n.length() == 0 || n.indexOf("..") >= 0) return false;
+    out = String(SD_MUSIC_DIR) + "/" + n;
+    return true;
+}
+
 static void api_upload()
 {
     HTTPUpload &u = g_http.upload();
@@ -1108,12 +1147,24 @@ static void api_upload()
         String n = u.filename;
         n = n.substring(n.lastIndexOf('/') + 1);
         if (!ends_with_mp3(n)) { g_up_err = "mp3 만 받는다"; return; }
-        // 업로드는 언제나 내장 플래시로. SD 에는 절대 쓰지 않는다.
-        String path = "/" + n;
-        if (LittleFS.exists(path)) LittleFS.remove(path);
-        g_up = LittleFS.open(path, FILE_WRITE);
-        if (!g_up) g_up_err = "플래시 열기 실패";
-        else Serial.printf("[up] %s 수신 시작\n", path.c_str());
+
+        // 대상: SD 가 있으면 SD 의 /MP3, 없으면 내장 플래시. ?to=flash 로 강제 가능.
+        const bool to_sd = g_have_sd && g_http.arg("to") != "flash";
+        if (to_sd) {
+            String path;
+            if (!sd_music_path(n, path)) { g_up_err = "파일 이름이 이상하다"; return; }
+            if (!SD_MMC.exists(SD_MUSIC_DIR)) SD_MMC.mkdir(SD_MUSIC_DIR);
+            if (SD_MMC.exists(path)) SD_MMC.remove(path);
+            g_up = SD_MMC.open(path, FILE_WRITE);
+            if (!g_up) g_up_err = "SD 열기 실패";
+            else Serial.printf("[up] SD %s 수신 시작\n", path.c_str());
+        } else {
+            String path = "/" + n;
+            if (LittleFS.exists(path)) LittleFS.remove(path);
+            g_up = LittleFS.open(path, FILE_WRITE);
+            if (!g_up) g_up_err = "플래시 열기 실패";
+            else Serial.printf("[up] 플래시 %s 수신 시작\n", path.c_str());
+        }
     } else if (u.status == UPLOAD_FILE_WRITE) {
         if (g_up && g_up_err.isEmpty()) {
             if (g_up.write(u.buf, u.currentSize) != u.currentSize) {
@@ -1204,11 +1255,17 @@ static void http_setup()
     g_http.on("/api/delete", HTTP_POST, [] {
         String n = g_http.arg("f");
         n = n.substring(n.lastIndexOf('/') + 1);
-        // 지우는 건 내장 플래시에 올린 것만. SD 는 손대지 않는다.
+        bool ok = false;
         String path = "/" + n;
-        bool ok = LittleFS.exists(path) && LittleFS.remove(path);
+        if (LittleFS.exists(path)) ok = LittleFS.remove(path);
+        // SD 는 **/MP3 안에서만** 지운다. DCIM 등 원래 내용은 어떤 경로로도 못 지운다.
+        if (!ok && g_have_sd) {
+            String sp;
+            if (sd_music_path(n, sp) && SD_MMC.exists(sp)) ok = SD_MMC.remove(sp);
+        }
         if (ok) { cmd_stop(); lib_rescan(); }
-        g_http.send(ok ? 200 : 404, "text/plain", ok ? "ok" : "플래시에 없는 파일(SD 는 지우지 않는다)");
+        g_http.send(ok ? 200 : 404, "text/plain",
+                    ok ? "ok" : "없는 파일 (SD 는 /MP3 안에서만 지운다)");
     });
 
     g_http.on("/api/upload", HTTP_POST,
