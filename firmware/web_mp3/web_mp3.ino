@@ -90,6 +90,7 @@ static const i2s_port_t I2S_PORT_JACK = I2S_NUM_0;
 // 이 저장소의 "오디오는 죽었다" 결론 전체가 틀렸다. 근거는 arduino-audiokit 의
 // 이 보드 정의(WS 26 / DATA_OUT 25 / DATA_IN 35)와 고친 뒤의 실측이다.
 static const int PIN_MCLK = 0, PIN_BCLK = 27, PIN_LRCK = 26, PIN_DOUT = 25;
+static const int PIN_DIN  = 35;    // 코덱 → ESP32 (온보드 마이크 2개)
 static const int PIN_SDA = 33, PIN_SCL = 32;
 static const int I2S_BLOCK = 256;   // 프레임
 
@@ -125,6 +126,8 @@ static volatile bool   g_req_stop = false;      // 디코더에게 현재 곡을
 static volatile int    g_req_track = -1;        // >=0 이면 그 인덱스로 전환
 static volatile int    g_vol = 60;              // 0~100, 출력단에서 적용(즉시 반응)
 static volatile OutMode g_out = OUT_BT;         // 소리를 어디로 낼지
+static volatile uint16_t g_mic_vol = 0xa0a0;    // ADC_VOL_CTRL (마이크 게인)
+static volatile int      g_rec_peak = 0;        // 녹음 중 관측된 절대 최대값
 static volatile Role    g_role = ROLE_PLAYER;   // 플레이어냐 BT 스피커냐
 static volatile int     g_sink_hz = 44100;      // 싱크가 협상한 샘플레이트
 static volatile int     g_sink_ch = 2;
@@ -548,12 +551,28 @@ static void jack_setup()
         Serial.println("[잭] AC101 begin() 실패 — 잭 출력을 쓸 수 없다");
         return;
     }
-    g_codec.SetMode(AC101::MODE_DAC);           // 출력만 연다. 죽은 ADC 는 건드리지 않는다
+    // 플레이어 모드는 ADC 까지 연다(녹음). 마이크 입력 설정은 실측으로 확정된 값이다:
+    // ADC_SRC=0x2020 이 온보드 마이크 2개, BST=0xccc4. (mic_scan 참고)
+    if (g_role == ROLE_PLAYER) {
+        g_codec.SetMode(AC101::MODE_ADC_DAC);
+        g_codec.wr(0x51, 0x2020);   // ADC_SRC — 온보드 마이크 L/R
+        g_codec.wr(0x52, 0xccc4);   // ADC_SRCBST_CTRL — 마이크 부스트
+        // ADC_VOL_CTRL. 0xc0c0 은 loopback_test 가 **자기 톤 검파용**으로 고른 값이고
+        // 녹음에는 과하다 — 실측에서 최대값이 32767 에 붙어 클리핑했다(RMS 10152).
+        // 0xa0a0(begin() 기본값)이면 무음 바닥이 RMS 700 쯤이라 헤드룸이 넉넉하다.
+        g_codec.wr(0x41, g_mic_vol);
+    } else {
+        g_codec.SetMode(AC101::MODE_DAC);
+    }
     g_codec.SetVolumeHeadphone(50);
     g_codec.SetVolumeSpeaker(50);
 
     i2s_config_t cfg = {};
-    cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    // 플레이어 모드는 **전이중**으로 연다 — 녹음(온보드 마이크 2ch)을 하려면 RX 가
+    // 같이 있어야 한다. 싱크 모드는 출력만 쓰므로 TX 만 연다(내부 DRAM 절약).
+    cfg.mode = (g_role == ROLE_PLAYER)
+                 ? (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX)
+                 : (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
     cfg.sample_rate = OUT_HZ;
     cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
     cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
@@ -575,7 +594,7 @@ static void jack_setup()
     pins.bck_io_num = PIN_BCLK;
     pins.ws_io_num = PIN_LRCK;
     pins.data_out_num = PIN_DOUT;
-    pins.data_in_num = I2S_PIN_NO_CHANGE;       // 입력을 아예 만들지 않는다
+    pins.data_in_num = (g_role == ROLE_PLAYER) ? PIN_DIN : I2S_PIN_NO_CHANGE;
     i2s_set_pin(I2S_PORT_JACK, &pins);
 
     // IRAM 은 16비트 접근이 불법이다(LoadStoreError). DMA 가능 메모리로 잡는다.
@@ -725,6 +744,122 @@ static void storage_setup()
         Serial.println("[sd] 읽기 전용으로만 쓴다 — 이 펌웨어는 SD 에 쓰지 않는다");
     } else {
         Serial.println("[sd] 마운트 실패 — 카드 없음 또는 가운데 DIP 스위치가 SD 로 안 붙어 있다");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────── 녹음 (마이크 → SD)
+//
+// 온보드 마이크 2개가 살아있는 것이 실측으로 확정됐다(무음 RMS 600~700, mic_scan).
+// 44.1kHz 16비트 스테레오 WAV 로 SD 의 /REC 에 쓴다 — 초당 176KB 다.
+//
+// 재생과 동시에 하지 않는다. 마이크는 보드 위에 있어서 잭/스피커로 나가는 소리를
+// 그대로 다시 듣는다(자기 소리가 녹음에 섞인다).
+
+static const char *SD_REC_DIR = "/REC";
+
+// 마이크 게인 프리셋. 낮음 → 높음.
+static const uint16_t MIC_VOLS[] = {0x8080, 0xa0a0, 0xb0b0, 0xc0c0};
+static volatile bool     g_rec = false;
+static volatile uint32_t g_rec_bytes = 0;
+static volatile float    g_rec_lvl_l = 0, g_rec_lvl_r = 0;
+static String            g_rec_name;
+static File              g_rec_file;
+
+// 44바이트 표준 WAV 헤더. 길이는 0 으로 써 두고 끝낼 때 되돌아가 채운다.
+static void wav_header(File &f, uint32_t data_bytes)
+{
+    const uint32_t rate = OUT_HZ, ch = 2, bits = 16;
+    const uint32_t byte_rate = rate * ch * bits / 8;
+    uint8_t h[44];
+    memcpy(h, "RIFF", 4);
+    const uint32_t riff = 36 + data_bytes;  memcpy(h + 4, &riff, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    const uint32_t fmt_len = 16;            memcpy(h + 16, &fmt_len, 4);
+    const uint16_t pcm = 1, chn = ch;       memcpy(h + 20, &pcm, 2); memcpy(h + 22, &chn, 2);
+    memcpy(h + 24, &rate, 4);               memcpy(h + 28, &byte_rate, 4);
+    const uint16_t align = ch * bits / 8, bps = bits;
+    memcpy(h + 32, &align, 2);              memcpy(h + 34, &bps, 2);
+    memcpy(h + 36, "data", 4);              memcpy(h + 40, &data_bytes, 4);
+    f.write(h, 44);
+}
+
+static bool rec_start()
+{
+    if (g_rec) return true;
+    if (g_role != ROLE_PLAYER) return false;
+    if (!g_have_sd) return false;           // 플래시는 960KB = 5초뿐이라 의미가 없다
+    cmd_stop();                             // 재생을 접는다(자기 소리가 섞인다)
+
+    if (!SD_MMC.exists(SD_REC_DIR)) SD_MMC.mkdir(SD_REC_DIR);
+    const int n = g_prefs.getInt("recno", 0) + 1;
+    g_prefs.putInt("recno", n);
+    char nm[40];
+    snprintf(nm, sizeof nm, "%s/rec_%03d.wav", SD_REC_DIR, n);
+
+    xSemaphoreTake(g_fsmux, portMAX_DELAY);
+    g_rec_file = SD_MMC.open(nm, FILE_WRITE);
+    if (g_rec_file) wav_header(g_rec_file, 0);
+    xSemaphoreGive(g_fsmux);
+    if (!g_rec_file) { Serial.printf("[녹음] %s 열기 실패\n", nm); return false; }
+
+    g_rec_name = String(nm);
+    g_rec_bytes = 0;
+    g_rec_peak = 0;
+    g_rec = true;
+    Serial.printf("[녹음] ● %s 시작 (44.1kHz 16bit 2ch, 176KB/s)\n", nm);
+    return true;
+}
+
+static void rec_stop()
+{
+    if (!g_rec) return;
+    g_rec = false;
+    vTaskDelay(pdMS_TO_TICKS(120));         // 태스크가 쓰기를 마치도록 잠깐 기다린다
+    xSemaphoreTake(g_fsmux, portMAX_DELAY);
+    if (g_rec_file) {
+        // 헤더의 길이 두 곳을 되돌아가 채운다. 안 하면 재생기가 길이를 모른다.
+        const uint32_t n = g_rec_bytes;
+        g_rec_file.seek(0);
+        wav_header(g_rec_file, n);
+        g_rec_file.close();
+    }
+    xSemaphoreGive(g_fsmux);
+    Serial.printf("[녹음] ■ %s (%u KB, %.1f초)\n", g_rec_name.c_str(),
+                  (unsigned)(g_rec_bytes / 1024), g_rec_bytes / (float)(OUT_HZ * 4));
+    lib_rescan();
+}
+
+static void rec_task(void *)
+{
+    static int16_t buf[512 * 2];            // 512프레임 = 약 11.6ms
+    for (;;) {
+        if (!g_rec) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+
+        size_t got = 0;
+        if (i2s_read(I2S_PORT_JACK, buf, sizeof buf, &got, pdMS_TO_TICKS(200)) != ESP_OK || !got) continue;
+
+        // 레벨 미터 — 웹에서 마이크가 실제로 소리를 물고 있는지 보이게 한다
+        double el = 0, er = 0;
+        const int frames = (int)(got / 4);
+        int peak = g_rec_peak;
+        for (int i = 0; i < frames; i++) {
+            el += (double)buf[2 * i] * buf[2 * i];
+            er += (double)buf[2 * i + 1] * buf[2 * i + 1];
+            const int a = abs(buf[2 * i]), b = abs(buf[2 * i + 1]);
+            if (a > peak) peak = a;
+            if (b > peak) peak = b;
+        }
+        g_rec_peak = peak;                  // 32767 에 붙으면 클리핑 — 게인을 낮춰라
+        if (frames) {
+            g_rec_lvl_l = (float)sqrt(el / frames);
+            g_rec_lvl_r = (float)sqrt(er / frames);
+        }
+
+        xSemaphoreTake(g_fsmux, portMAX_DELAY);
+        const size_t w = g_rec_file ? g_rec_file.write((uint8_t *)buf, got) : 0;
+        xSemaphoreGive(g_fsmux);
+        if (w != got) { Serial.println("[녹음] 쓰기 실패 — 중단"); g_rec = false; }
+        g_rec_bytes += w;
     }
 }
 
@@ -980,6 +1115,12 @@ static void api_status()
     j += "\"src\":\""; j += String(g_src_hz) + "Hz/" + String(g_src_ch) + "ch/" + String(g_bitrate) + "k"; j += "\",";
     j += "\"under\":"; j += String((unsigned)g_underruns); j += ",";
     j += "\"heap\":"; j += String((unsigned)ESP.getFreeHeap()); j += ",";
+    j += "\"recpeak\":"; j += String((int)g_rec_peak); j += ",";
+    j += "\"micvol\":\""; { char b[10]; snprintf(b, sizeof b, "0x%04X", g_mic_vol); j += b; } j += "\",";
+    j += "\"rec\":"; j += g_rec ? "true," : "false,";
+    j += "\"recsec\":"; j += String(g_rec_bytes / (float)(OUT_HZ * 4), 1); j += ",";
+    j += "\"reclvl\":["; j += String((int)g_rec_lvl_l) + "," + String((int)g_rec_lvl_r); j += "],";
+    j += "\"recname\":\""; j += json_escape(g_rec_name); j += "\",";
     j += "\"role\":\""; j += (g_role == ROLE_SINK ? "sink" : "player"); j += "\",";
     j += "\"sinkhz\":"; j += String((int)g_sink_hz); j += ",";
     j += "\"sinkkb\":"; j += String((unsigned)(g_sink_bytes / 1024)); j += ",";
@@ -1236,6 +1377,26 @@ static void http_setup()
         cmd_out(g_http.arg("m") == "jack" ? OUT_JACK : OUT_BT);
         g_http.send(200, "text/plain", "ok");
     });
+    // 마이크 게인 0~3 (낮음→높음). 클리핑(peak 32767)이면 낮춘다.
+    g_http.on("/api/micgain", HTTP_POST, [] {
+        const int i = constrain(g_http.arg("v").toInt(), 0, 3);
+        g_mic_vol = MIC_VOLS[i];
+        g_prefs.putInt("micvol", g_mic_vol);
+        if (g_codec_ok) g_codec.wr(0x41, g_mic_vol);
+        char b[40]; snprintf(b, sizeof b, "ADC_VOL_CTRL=0x%04X", g_mic_vol);
+        g_http.send(200, "text/plain", b);
+    });
+    g_http.on("/api/rec", HTTP_POST, [] {
+        const bool on = (g_http.arg("on") == "1");
+        if (on) {
+            const bool ok = rec_start();
+            g_http.send(ok ? 200 : 503, "text/plain",
+                        ok ? "녹음 시작" : (g_have_sd ? "시작 실패" : "SD 가 없다(플래시는 5초뿐)"));
+        } else {
+            rec_stop();
+            g_http.send(200, "text/plain", "녹음 정지");
+        }
+    });
     g_http.on("/api/avrc", HTTP_POST, [] {
         avrc_cmd(g_http.arg("c"));
         g_http.send(200, "text/plain", g_role == ROLE_SINK ? "ok" : "싱크 모드에서만 동작한다");
@@ -1429,6 +1590,7 @@ void setup()
     g_vol = g_prefs.getInt("vol", 60);
     g_out = (OutMode)g_prefs.getInt("out", (int)OUT_BT);
     g_role = (Role)g_prefs.getInt("role", (int)ROLE_PLAYER);
+    g_mic_vol = (uint16_t)g_prefs.getInt("micvol", 0xa0a0);
 
     // 큰 버퍼는 전부 PSRAM 으로. 내부 DRAM 은 BT+WiFi 스택에 남겨야 한다.
     if (!psramFound()) Serial.println("[mem] PSRAM 이 안 보인다 — PSRAM=enabled 로 빌드했는지 확인");
@@ -1472,6 +1634,8 @@ void setup()
     // 디코더와 잭 송출은 코어 1 에. WiFi/BT 스택은 코어 0 에서 돈다.
     xTaskCreatePinnedToCore(decode_task, "dec", 6144, nullptr, 5, nullptr, 1);
     if (g_codec_ok) xTaskCreatePinnedToCore(jack_task, "jack", 4096, nullptr, 6, nullptr, 1);
+    if (g_codec_ok && g_role == ROLE_PLAYER)
+        xTaskCreatePinnedToCore(rec_task, "rec", 4096, nullptr, 4, nullptr, 1);
 
     // 초기화가 끝난 뒤의 내부 힙이 진짜 여유다. 여기가 20KB 밑으로 떨어지면
     // 재생을 걸었을 때 파일 열기에서 죽는다 — 실제로 한 번 그렇게 죽었다.
