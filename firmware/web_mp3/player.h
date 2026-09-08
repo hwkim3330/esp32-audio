@@ -20,6 +20,12 @@ enum OutMode { OUT_BT, OUT_JACK };
 //   ROLE_SINK   : 맥·폰이 이 보드에 연결 → 그 소리가 잭으로 나온다 (BT 스피커)
 enum Role { ROLE_PLAYER, ROLE_SINK };
 
+// 실시간 처리 모드. 웹 UI 의 세 버튼과 1:1 로 대응한다.
+//   PM_NORMAL  : 처리 없음 — 음악 재생/싱크(기존 동작 그대로)
+//   PM_HEARING : 보청기 — 빔포밍 + 적응 잡음억제 + 말소리 EQ + 컴프레서
+//   PM_NR      : 잡음억제만 — 같은 빔포밍/NLMS, EQ·컴프레서 없이 평탄하게
+enum ProcMode { PM_NORMAL, PM_HEARING, PM_NR };
+
 struct Track {
     String name;
     String path;

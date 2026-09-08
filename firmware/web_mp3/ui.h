@@ -44,6 +44,8 @@ progress{width:100%;height:5px}
 .keys{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;font-size:12px;color:var(--dim)}
 .keys div{background:#0e1016;border:1px solid var(--line);border-radius:7px;padding:6px 8px}
 .keys b{color:var(--fg);font-weight:600}
+.lbl{color:var(--dim);font-size:12px;min-width:5.6em}
+.val{width:4.2em;text-align:right;font-variant-numeric:tabular-nums;font-size:12px;color:var(--fg)}
 </style></head><body><div class="wrap">
 
 <h1>ESP32-Audio-Kit · MP3</h1>
@@ -127,6 +129,89 @@ progress{width:100%;height:5px}
   <div class="note" id="upmsg"></div>
 </div>
 
+<div class="card" id="aidcard">
+  <div class="row spread" style="margin-bottom:8px">
+    <h2 style="margin:0">실시간 처리</h2>
+    <span id="pmst" class="pill">…</span>
+  </div>
+  <div class="row">
+    <button id="pm0" onclick="pmode('normal')">Normal</button>
+    <button id="pm1" onclick="pmode('hearing')">Hearing Aid</button>
+    <button id="pm2" onclick="pmode('nr')">Noise Suppression</button>
+  </div>
+
+  <div class="row" style="margin-top:12px">
+    <span class="lbl">mic gain</span>
+    <input type="range" id="mg" min="0" max="3" onchange="post('/api/micgain?v='+this.value)">
+    <span id="mgv" class="val">—</span>
+  </div>
+  <div class="row">
+    <span class="lbl">speech gain</span>
+    <input type="range" id="sg" min="0" max="24" oninput="sgv.textContent=this.value+' dB'" onchange="post('/api/aid?speech='+this.value)">
+    <span id="sgv" class="val">—</span>
+  </div>
+  <div class="row">
+    <span class="lbl">NR strength</span>
+    <input type="range" id="nr" min="0" max="100" oninput="nrv.textContent=this.value+'%'" onchange="post('/api/aid?nr='+this.value)">
+    <span id="nrv" class="val">—</span>
+  </div>
+  <div class="row">
+    <span class="lbl">out gain</span>
+    <input type="range" id="og" min="50" max="400" step="10" oninput="ogv.textContent=this.value+'%'" onchange="post('/api/aid?gain='+this.value)">
+    <span id="ogv" class="val">—</span>
+  </div>
+  <div class="row">
+    <span class="lbl">beam</span>
+    <button class="sm" id="bm0" onclick="post('/api/aid?beam=0')">합 (정면 우선)</button>
+    <button class="sm" id="bm1" onclick="post('/api/aid?beam=1')">차동 (측면 널)</button>
+    <span class="lbl">지연</span>
+    <input type="range" id="bd" min="0" max="8" style="max-width:90px" oninput="bdv.textContent=this.value" onchange="post('/api/aid?bd='+this.value)">
+    <span id="bdv" class="val">—</span>
+  </div>
+
+  <div class="keys" style="margin-top:12px;grid-template-columns:repeat(2,1fr)">
+    <div><b id="k_raw">—</b> raw RMS (마이크 1개)</div>
+    <div><b id="k_beam">—</b> 빔포밍 이득</div>
+    <div><b id="k_in">—</b> 빔포밍 후 RMS</div>
+    <div><b id="k_noise">—</b> noise RMS (잡음 기준)</div>
+    <div><b id="k_out">—</b> 출력 RMS</div>
+    <div><b id="k_nr">—</b> NLMS 감소량</div>
+    <div><b id="k_lat">—</b> latency (해석)</div>
+    <div><b id="k_latm">—</b> latency (실측 왕복)</div>
+  </div>
+  <div class="note">빔포밍은 <b>합=정면 우선</b>(두 마이크에 같은 위상으로 오는 소리가 살아남는다),
+  <b>차동=측면 널</b>이다. 마이크 간격을 모르므로 정밀 조향은 못 한다 — <b>noise RMS 를 보며</b>
+  지연을 0~8샘플로 맞춰라. 잡음 기준은 항상 차동 신호(정면이 상쇄되어 잡음만 남는다)이고,
+  거기에 NLMS 16탭을 적응시켜 뺀다(Griffiths-Jim 구조).<br>
+  <b>진짜 ANC 는 넣지 않았다</b> — 역위상 상쇄는 왕복 지연이 파장 절반보다 짧아야 하는데
+  저지연 설정에서도 4~6ms 다(1kHz 반주기 0.5ms). 억지로 만들지 않고 빔포밍 + 적응
+  잡음억제 + 보청(증폭·압축)으로 구성했다.</div>
+</div>
+
+<div class="card" id="diagcard">
+  <div class="row spread" style="margin-bottom:8px">
+    <h2 style="margin:0">노이즈 원인 분리 진단</h2>
+    <span id="dgst" class="pill">…</span>
+  </div>
+  <div class="row">
+    <button onclick="post('/api/diag')">진단 실행 (약 2.5초, 소리 멈춤)</button>
+    <button class="sm" onclick="post('/api/statreset')">카운터 초기화</button>
+  </div>
+  <div class="keys" style="margin-top:10px;grid-template-columns:repeat(2,1fr)">
+    <div><b id="d_fl">—</b> 무음 노이즈 바닥 (볼륨 최대/중간/0)</div>
+    <div><b id="d_scale">—</b> 볼륨 의존성 → 발생 위치</div>
+    <div><b id="d_hum">—</b> 전원 성분 50/60/100/120Hz</div>
+    <div><b id="d_bb">—</b> 광대역(화이트노이즈)</div>
+    <div><b id="d_drift">—</b> 드리프트 보정 (건너뜀/겹침)</div>
+    <div><b id="d_star">—</b> 굶음 / 버림 / 오버런</div>
+  </div>
+  <div class="note"><b>내부 루프백</b>(<code>ADC_SRC=0x0101</code>)으로 잰다 — 코덱 안에서 출력이
+  입력으로 되돌아오는 경로라 마이크·음향 없이 출력단을 전기적으로 계측할 수 있다.
+  노이즈 바닥이 <b>볼륨에 따라 변하면 볼륨단 이전</b>(디지털·DAC), <b>안 변하면 이후</b>
+  (출력 스테이지·전원)에서 생기는 것이다. hum 선이 광대역의 30% 를 넘으면 전원·접지
+  문제이므로 <b>USB 를 PC 에서 빼고 충전기·보조배터리로</b> 바꿔 다시 재라.</div>
+</div>
+
 <div class="card" id="reccard">
   <div class="row spread" style="margin-bottom:8px">
     <h2 style="margin:0">녹음 (온보드 마이크 2개)</h2>
@@ -179,7 +264,11 @@ progress{width:100%;height:5px}
 
 <script>
 const $=id=>document.getElementById(id);
-let dragVol=false;
+let dragVol=false, dragging=false;
+['mg','sg','nr','og','bd'].forEach(id=>{
+  document.addEventListener('pointerdown',e=>{ if(e.target.id===id) dragging=true; });
+});
+document.addEventListener('pointerup',()=>{ dragging=false; });
 $('vol').addEventListener('pointerdown',()=>dragVol=true);
 $('vol').addEventListener('pointerup',()=>dragVol=false);
 const mmss=s=>{s=Math.max(0,Math.round(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
@@ -195,6 +284,40 @@ async function tick(){
   $('pb').style.width = (s.pct||0)+'%';
   $('ela').textContent = mmss(s.elapsed); $('tot').textContent = s.duration?mmss(s.duration):'—:—';
   if(!dragVol){ $('vol').value=s.vol; $('vlab').textContent=s.vol; }
+
+  // 실시간 처리 모드
+  const pm = s.pmode;
+  $('aidcard').hidden = (s.role=='sink');
+  $('diagcard').hidden = (s.role=='sink');
+  $('pmst').textContent = pm=='hearing'?'Hearing Aid':pm=='nr'?'Noise Suppression':'Normal';
+  $('pmst').className='pill '+(pm=='normal'?'':'ok');
+  $('pm0').className = pm=='normal'?'p':''; $('pm1').className = pm=='hearing'?'p':''; $('pm2').className = pm=='nr'?'p':'';
+  $('bm0').className = 'sm'+(s.beam==0?' p':''); $('bm1').className='sm'+(s.beam==1?' p':'');
+  if(!dragging){
+    $('mg').value = ['0x8080','0xA0A0','0xB0B0','0xC0C0'].indexOf(s.micvol);
+    $('sg').value = s.speechgain; $('nr').value = s.nrstrength; $('og').value = s.outgain; $('bd').value = s.beamdelay;
+  }
+  $('mgv').textContent = s.micvol; $('sgv').textContent = s.speechgain+' dB';
+  $('nrv').textContent = s.nrstrength+'%'; $('ogv').textContent = s.outgain+'%'; $('bdv').textContent = s.beamdelay;
+  $('k_raw').textContent = s.mRaw;
+  $('k_beam').textContent = (s.beamdb>-90? s.beamdb.toFixed(1)+' dB':'—');
+  $('k_in').textContent = s.mIn; $('k_noise').textContent = s.mNoise; $('k_out').textContent = s.mOut;
+  $('k_nr').textContent = (s.nrdb>-90? s.nrdb.toFixed(1)+' dB':'—');
+  $('k_lat').textContent = s.latms+' ms';
+  $('k_latm').textContent = s.latmeas>=0 ? s.latmeas+' ms' : (s.diag.latSamples==-3?'해상도 아래':(s.diag.latSamples==-2?'정적 확보 실패':'미측정'));
+
+  // 진단
+  const d = s.diag;
+  $('dgst').textContent = d.busy?'측정 중…':(d.latSamples>=0||d.floorHi>0?'측정됨':'미실행');
+  $('dgst').className='pill '+(d.busy?'warn':(d.floorHi>0?'ok':''));
+  $('d_fl').textContent = d.floorHi.toFixed(1)+' / '+d.floorMid.toFixed(1)+' / '+d.floorLo.toFixed(1);
+  const sc = d.floorLo>0 ? (d.floorHi/d.floorLo) : 0;
+  $('d_scale').textContent = d.floorHi>0 ? (sc.toFixed(1)+'배 → '+(sc>2?'볼륨단 이전':'볼륨단 이후')) : '—';
+  $('d_hum').textContent = d.hum50.toFixed(1)+'/'+d.hum60.toFixed(1)+'/'+d.hum100.toFixed(1)+'/'+d.hum120.toFixed(1);
+  const hm = Math.max(d.hum50,d.hum60,d.hum100,d.hum120);
+  $('d_bb').textContent = d.bb.toFixed(1)+(d.bb>0? (hm>d.bb*0.3?' · 전원 지배':' · 광대역 지배'):'');
+  $('d_drift').textContent = s.dskip+' / '+s.ddup;
+  $('d_star').textContent = s.starve+' / '+s.sinkdrop+' / '+s.aidover;
 
   // 녹음
   $('reccard').hidden = (s.role=='sink');
@@ -244,6 +367,8 @@ async function sd(p){
     ).join('') : '<li><span class="nm" style="color:var(--dim)">비어 있음</span></li>');
 }
 const esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+async function post(u){ try{ await fetch(u,{method:'POST'}) }catch(e){} tick(); }
+async function pmode(m){ await post('/api/mode?m='+m); }
 async function rec(nc){ await fetch('/api/rec?on='+(window._rec?'0':'1')+'&nc='+nc,{method:'POST'}); tick(); }
 async function role(r){ if(!confirm(r=='sink'?'BT 스피커로 바꾸고 재부팅한다':'플레이어로 바꾸고 재부팅한다'))return;
   await fetch('/api/role?r='+r,{method:'POST'}); $('upmsg').textContent='역할 전환, 재부팅 중…'; }

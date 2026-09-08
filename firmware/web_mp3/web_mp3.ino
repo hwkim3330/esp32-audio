@@ -50,6 +50,7 @@
 
 #include "minimp3.h"
 #include "player.h"
+#include "dsp.h"
 #include "ui.h"
 
 // ─────────────────────────────────────────────────────────────── 하드웨어 상수
@@ -127,6 +128,35 @@ static volatile int    g_req_track = -1;        // >=0 이면 그 인덱스로 �
 static volatile int    g_vol = 60;              // 0~100, 출력단에서 적용(즉시 반응)
 static volatile OutMode g_out = OUT_BT;         // 소리를 어디로 낼지
 static volatile uint16_t g_mic_vol = 0xa0a0;    // ADC_VOL_CTRL (마이크 게인)
+
+// ── 실시간 처리 모드.
+//
+//   PM_NORMAL  : 처리 없음. 음악 재생·싱크가 이걸 쓴다(기존 동작 그대로).
+//   PM_HEARING : 보청기 — 마이크 2개 → 빔포밍 + 잡음억제 + 말소리 EQ + 컴프레서 → 잭
+//   PM_NR      : 잡음억제만 — 같은 빔포밍/NLMS 에 EQ·컴프레서 없이 평탄하게
+//
+// 모드 전환은 I2S 를 다시 설치해야 한다(지연을 바꾸므로). jack_task 와 aid_task 가
+// 같은 포트를 쓰기 때문에 핸드셰이크로 소유권을 넘긴다.
+static volatile ProcMode g_pmode = PM_NORMAL;
+static volatile int      g_mode_req = -1;       // 목표 모드(-1 = 요청 없음)
+static volatile bool     g_jack_idle = false;   // jack_task 가 I2S 를 놓았는가
+
+static volatile int   g_speech_gain_db = 8;     // 프레즌스 부스트 (0~24)
+static volatile int   g_nr_strength = 70;       // NLMS 빼는 양 (0~100)
+static volatile int   g_out_gain = 100;         // 출력 게인 % (100~400)
+static volatile int   g_beam = 0;               // 0 = 합(정면), 1 = 차동(측면 널)
+static volatile int   g_beam_delay = 0;         // R 채널 지연 (0~8 샘플)
+
+// 계측값 — 웹 UI 와 시리얼에 그대로 나간다
+static volatile float g_m_raw = 0, g_m_in = 0, g_m_noise = 0, g_m_out = 0;
+static volatile float g_m_nr_db = 0, g_m_beam_db = 0;
+static volatile float g_lat_ms = 0;             // 해석적 지연 (DMA + 블록)
+static volatile int   g_lat_meas = -1;          // 실측 왕복 지연 (샘플, 진단으로 측정)
+static volatile uint32_t g_aid_blocks = 0, g_aid_overruns = 0;
+
+// 진단이 I2S 를 배타적으로 쓰는 동안 다른 태스크는 손을 뗀다.
+// (이걸 빼먹어서 두 태스크가 같은 포트에 써서 죽었다 — 선언을 앞에 둬야 다 본다)
+static volatile bool g_diag_busy = false;
 static volatile int      g_rec_peak = 0;        // 녹음 중 관측된 절대 최대값
 static volatile Role    g_role = ROLE_PLAYER;   // 플레이어냐 BT 스피커냐
 static volatile int     g_sink_hz = 44100;      // 싱크가 협상한 샘플레이트
@@ -578,6 +608,54 @@ static void apply_codec_volume()
     g_codec.SetVolumeSpeaker(hv);
 }
 
+// 모드에 따라 I2S 를 다시 설치한다.
+//
+// 보청기는 지연이 생명이라 DMA 를 잘게 쪼갠다(3×64프레임 = 4.4ms). 반대로 음악
+// 재생은 SD 읽기·웹서버에 밀려도 끊기지 않아야 하므로 넉넉해야 한다(8×256 = 46ms).
+// 하나로 타협하면 둘 다 나빠진다.
+static int g_i2s_bufs = 8, g_i2s_len = 256;
+
+static void i2s_install(bool low_latency)
+{
+    // 저지연은 3×32프레임. 해석 지연 (2×3×32 + 32)/44100 = 5.1ms 다.
+    // 더 줄이면 인터럽트 부담이 커져 오버런이 늘고, 늘리면 보청기로 못 쓴다.
+    g_i2s_bufs = low_latency ? 3 : ((g_role == ROLE_SINK) ? 8 : 4);
+    g_i2s_len  = low_latency ? 32 : I2S_BLOCK;
+
+    i2s_config_t cfg = {};
+    cfg.mode = (g_role == ROLE_PLAYER)
+                 ? (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX)
+                 : (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    cfg.sample_rate = OUT_HZ;
+    cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    cfg.dma_buf_count = g_i2s_bufs;
+    cfg.dma_buf_len = g_i2s_len;
+    cfg.use_apll = false;
+    cfg.tx_desc_auto_clear = true;
+    if (i2s_driver_install(I2S_PORT_JACK, &cfg, 0, nullptr) != ESP_OK) {
+        Serial.println("[잭] I2S 설치 실패");
+        g_codec_ok = false;
+        return;
+    }
+    i2s_pin_config_t pins = {};
+    pins.mck_io_num = PIN_MCLK;
+    pins.bck_io_num = PIN_BCLK;
+    pins.ws_io_num = PIN_LRCK;
+    pins.data_out_num = PIN_DOUT;
+    pins.data_in_num = (g_role == ROLE_PLAYER) ? PIN_DIN : I2S_PIN_NO_CHANGE;
+    i2s_set_pin(I2S_PORT_JACK, &pins);
+
+    // 해석적 지연 = DMA 가 쌓아 두는 양 + 한 번에 처리하는 블록.
+    // 처음엔 입출력 DMA 를 각각 세어 두 배로 했는데 **실측이 틀렸다고 알려줬다**:
+    // 4×256 에서 해석 52.2ms 대 실측 29.73ms. (4×256+256)/44100 = 29.0ms 가 맞다.
+    g_lat_ms = (g_i2s_bufs * g_i2s_len + g_i2s_len) * 1000.0f / OUT_HZ;
+    Serial.printf("[i2s] DMA %d×%d (%s), 해석 지연 %.1fms\n",
+                  g_i2s_bufs, g_i2s_len, low_latency ? "저지연" : "안정", g_lat_ms);
+}
+
 static void jack_setup()
 {
     // AC101 은 I2C 로는 늘 완벽하게 대답한다 — 지금까지 한 번도 실패한 적 없다.
@@ -602,35 +680,8 @@ static void jack_setup()
     g_codec.SetVolumeHeadphone(50);
     g_codec.SetVolumeSpeaker(50);
 
-    i2s_config_t cfg = {};
-    // 플레이어 모드는 **전이중**으로 연다 — 녹음(온보드 마이크 2ch)을 하려면 RX 가
-    // 같이 있어야 한다. 싱크 모드는 출력만 쓰므로 TX 만 연다(내부 DRAM 절약).
-    cfg.mode = (g_role == ROLE_PLAYER)
-                 ? (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX)
-                 : (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
-    cfg.sample_rate = OUT_HZ;
-    cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-    cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-    cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-    // 싱크 모드는 SD/LittleFS 를 안 올려 내부 DRAM 여유가 있으니 DMA 를 넉넉히 준다.
-    // 23ms(4개)면 웹서버·BT 태스크에 밀릴 때 DMA 가 굶어 딱딱거린다.
-    cfg.dma_buf_count = (g_role == ROLE_SINK) ? 8 : 4;   // 8×256프레임 ≈ 46ms
-    cfg.dma_buf_len = I2S_BLOCK;
-    cfg.use_apll = false;
-    cfg.tx_desc_auto_clear = true;
-    if (i2s_driver_install(I2S_PORT_JACK, &cfg, 0, nullptr) != ESP_OK) {
-        Serial.println("[잭] I2S 설치 실패");
-        g_codec_ok = false;
-        return;
-    }
-    i2s_pin_config_t pins = {};
-    pins.mck_io_num = PIN_MCLK;
-    pins.bck_io_num = PIN_BCLK;
-    pins.ws_io_num = PIN_LRCK;
-    pins.data_out_num = PIN_DOUT;
-    pins.data_in_num = (g_role == ROLE_PLAYER) ? PIN_DIN : I2S_PIN_NO_CHANGE;
-    i2s_set_pin(I2S_PORT_JACK, &pins);
+    i2s_install(false);
+    if (!g_codec_ok) return;
 
     // IRAM 은 16비트 접근이 불법이다(LoadStoreError). DMA 가능 메모리로 잡는다.
     g_i2s_buf = (int16_t *)heap_caps_malloc((size_t)I2S_BLOCK * 2 * sizeof(int16_t), MALLOC_CAP_DMA);
@@ -647,6 +698,17 @@ static void jack_task(void *)
 {
     for (;;) {
         if (!g_codec_ok) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+
+        // 모드 전환 요청·보청기 모드·진단 중이면 I2S 소유권을 넘긴다.
+        //
+        // ★ 진단(g_diag_busy)을 빼먹어서 한 번 죽었다. 진단이 i2s_write/read 를
+        //   하는 동안 여기서도 쓰면 같은 포트에 쓰는 태스크가 둘이 된다.
+        if (g_mode_req >= 0 || g_pmode != PM_NORMAL || g_diag_busy) {
+            g_jack_idle = true;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        g_jack_idle = false;
 
         const bool tone = (int32_t)(g_tone_until - millis()) > 0;
         // ★ 잭 경로에서는 디지털로 음량을 깎지 않는다. 0.36배 곱하면 정수 절단으로
@@ -937,7 +999,7 @@ static void rec_task(void *)
 {
     static int16_t buf[512 * 2];            // 512프레임 = 약 11.6ms
     for (;;) {
-        if (!g_rec) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+        if (!g_rec || g_diag_busy) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
 
         size_t got = 0;
         if (i2s_read(I2S_PORT_JACK, buf, sizeof buf, &got, pdMS_TO_TICKS(200)) != ESP_OK || !got) continue;
@@ -974,6 +1036,153 @@ static void rec_task(void *)
         xSemaphoreGive(g_fsmux);
         if (w != out_bytes) { Serial.println("[녹음] 쓰기 실패 — 중단"); g_rec = false; }
         g_rec_bytes += w;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────── 보청기 / 잡음억제
+//
+// 구조는 **Griffiths-Jim 형 사이드로브 캔슬러**다. 마이크 두 개로 할 수 있는 것 중
+// 가장 근거가 확실한 조합이라 이걸 골랐다:
+//
+//   합  s = (L+R)/2  → 두 마이크에 같은 위상으로 오는 소리(정면)가 살아남는다
+//   차  d = (L-R)    → 정면 성분은 상쇄되고 **주변 잡음만** 남는다 → 잡음 기준
+//   출력 = s - W·d   (W 는 NLMS 로 적응)
+//
+// 즉 "목소리 방향 우선" 은 정면(브로드사이드)을 목표로 두는 것으로 구현했다.
+// 마이크 간격을 모르므로 정밀 조향은 못 하고, 대신 R 에 걸 지연을 0~8샘플로
+// 조절할 수 있게 해서 사용자가 **noise RMS 를 보며** 맞출 수 있게 했다.
+//
+// 그 뒤로 말소리 대역(300Hz~6kHz) EQ, 프레즌스 부스트, 컴프레서·리미터.
+//
+// 진짜 ANC(역위상 되먹임)는 넣지 않았다 — 이 하드웨어에서 불가능하다. 왕복 지연이
+// 파장의 절반보다 짧아야 상쇄가 되는데, 저지연 설정에서도 해석 지연이 4~6ms 다.
+// 1kHz 의 반주기는 0.5ms 다. 그래서 억지로 만들지 않고 빔포밍 + 적응 잡음억제 +
+// 보청(증폭·압축)으로 구성했다.
+
+static Biquad g_hp_l, g_hp_r;        // DC·저역 hum 제거
+static Biquad g_sp_hp, g_sp_lp, g_sp_pk;   // 말소리 대역
+static Beamformer g_bf;
+static Nlms g_nl;
+static Compressor g_comp;
+// raw(한 마이크) → sig(빔포밍 후) → y(NLMS 후) → 최종출력.
+// 단계별로 재야 "빔포밍이 얼마나, NLMS 가 얼마나" 를 구분할 수 있다.
+static RmsMeter g_mr, g_mi, g_mn, g_mo, g_ms;
+
+static void aid_reset()
+{
+    g_hp_l.highpass(OUT_HZ, 150.0f, 0.707f);
+    g_hp_r.highpass(OUT_HZ, 150.0f, 0.707f);
+    g_sp_hp.highpass(OUT_HZ, 300.0f, 0.707f);
+    g_sp_lp.lowpass(OUT_HZ, 6000.0f, 0.707f);
+    g_sp_pk.peaking(OUT_HZ, 2500.0f, 1.0f, (float)g_speech_gain_db);
+    g_hp_l.reset(); g_hp_r.reset();
+    g_sp_hp.reset(); g_sp_lp.reset(); g_sp_pk.reset();
+    g_bf.reset(); g_nl.reset(); g_comp.reset();
+    g_bf.mode = (g_beam == 0) ? BEAM_SUM : BEAM_DIFF;
+    g_bf.delay = constrain(g_beam_delay, 0, BEAM_MAX_D);
+    g_nl.strength = g_nr_strength / 100.0f;
+    g_comp.set(OUT_HZ, 5.0f, 120.0f);
+    // 보청기는 압축이 본질이다. 임계를 낮추고 메이크업을 걸어 작은 소리를 끌어올린다
+    // (WDRC). 게인만 올리면 큰 소리에서 바로 클리핑한다.
+    g_comp.thresh = 3000.0f;
+    g_comp.ratio  = 3.0f;
+    g_comp.makeup = 3.0f;
+}
+
+// 모드를 실제로 적용한다. I2S 를 다시 설치하므로 jack_task 가 놓은 뒤에만 부른다.
+static void aid_apply_mode(ProcMode m)
+{
+    const bool low = (m != PM_NORMAL);
+    i2s_driver_uninstall(I2S_PORT_JACK);
+    i2s_install(low);
+    aid_reset();
+    g_pmode = m;
+    Serial.printf("[모드] %s (%s)\n",
+                  m == PM_NORMAL ? "일반" : (m == PM_HEARING ? "보청기" : "잡음억제"),
+                  low ? "저지연" : "안정");
+}
+
+static void aid_task(void *)
+{
+    static int16_t in[128 * 2], out[128 * 2];
+
+    for (;;) {
+        // 모드 전환 핸드셰이크
+        if (g_mode_req >= 0) {
+            if (!g_jack_idle) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
+            aid_apply_mode((ProcMode)g_mode_req);
+            g_mode_req = -1;
+            continue;
+        }
+        if (g_diag_busy) { g_jack_idle = true; vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+        if (g_pmode == PM_NORMAL || !g_codec_ok) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+
+        const size_t want = (size_t)g_i2s_len * 4;      // 프레임당 4바이트
+        const size_t cap = sizeof in;
+        const size_t nb = want < cap ? want : cap;
+
+        size_t got = 0;
+        if (i2s_read(I2S_PORT_JACK, in, nb, &got, pdMS_TO_TICKS(100)) != ESP_OK || got == 0) {
+            g_aid_overruns++;
+            continue;
+        }
+        const int frames = (int)(got / 4);
+        const float og = g_out_gain / 100.0f;
+        const bool hearing = (g_pmode == PM_HEARING);
+
+        for (int i = 0; i < frames; i++) {
+            // 1) DC·저역 제거. 일렉트릿은 DC 오프셋이 있고 전원 hum 이 저역에 앉는다.
+            const float l = g_hp_l.run((float)in[2 * i]);
+            const float r = g_hp_r.run((float)in[2 * i + 1]);
+
+            // 2) 빔포밍 — 합(정면 우선) 또는 차동(측면 널)
+            const float sig = g_bf.run(l, r);
+
+            // 3) 잡음 기준은 **목표와 반대쪽 조합**이어야 한다.
+            //
+            //    ★ 처음엔 언제나 차동(l-r)을 기준으로 썼다. beam=합 일 때는 맞지만
+            //      beam=차동 일 때는 목표 신호와 기준이 같아져서 NLMS 가 자기 자신을
+            //      지운다 — 실측에서 NR 100% 로 올리자 감소 133dB, **출력 0** 이 됐다.
+            //    - 목표=합(정면)  → 기준은 차동 (정면이 상쇄된 잡음)
+            //    - 목표=차동(측면) → 기준은 합   (정면 공통 성분)
+            const float ref = (g_bf.mode == BEAM_SUM) ? (l - r) : (0.5f * (l + r));
+
+            // 4) 적응 잡음억제
+            float y = g_nl.run(sig, ref);
+
+            g_mr.add(l);          // 빔포밍 전(마이크 하나)
+            g_mi.add(sig);
+            g_mn.add(ref);
+            g_ms.add(y);          // NLMS 직후 — EQ·컴프레서 전. 감소량은 이걸로 잰다
+
+            // 5) 보청기 모드에서만 말소리 대역 EQ + 컴프레서
+            if (hearing) {
+                y = g_sp_pk.run(g_sp_lp.run(g_sp_hp.run(y)));
+                y = g_comp.run(y * og);
+            } else {
+                y *= og;
+                if (y > 30000.0f) y = 30000.0f;
+                else if (y < -30000.0f) y = -30000.0f;
+            }
+
+            g_mo.add(y);
+            const int16_t v = (int16_t)y;
+            out[2 * i] = v;
+            out[2 * i + 1] = v;          // 모노를 양쪽으로
+        }
+
+        g_mr.commit(); g_mi.commit(); g_mn.commit(); g_mo.commit(); g_ms.commit();
+        g_m_raw = g_mr.value; g_m_in = g_mi.value;
+        g_m_noise = g_mn.value; g_m_out = g_mo.value;
+        // 빔포밍 단독 이득. 상관 없는 잡음이라면 합에서 약 3dB 가 나와야 한다.
+        g_m_beam_db = rms_db(g_mr.value, g_mi.value);
+        // ★ 감소량은 **NLMS 전후**로만 잰다. 최종 출력과 비교하면 EQ·컴프레서 게인이
+        //   섞여 음수가 나온다(실제로 -0.9dB 로 나와서 고쳤다).
+        g_m_nr_db = rms_db(g_mi.value, g_ms.value);
+
+        size_t wrote = 0;
+        i2s_write(I2S_PORT_JACK, out, (size_t)frames * 4, &wrote, portMAX_DELAY);
+        g_aid_blocks++;
     }
 }
 
@@ -1185,6 +1394,180 @@ static void cmd_out(OutMode m)
     if (g_state == ST_PLAY && g_idx >= 0) cmd_play(g_idx);
 }
 
+// ─────────────────────────────────────────────────────────────── 노이즈 원인 분리 진단
+//
+// "지지직/화이트노이즈" 는 원인이 여러 개 겹쳐 있어서 귀로는 못 가른다. 각각에
+// **다른 계측값**을 붙여 분리한다:
+//
+//  ① BT 싱크 ↔ I2S 클럭 드리프트  → dskip/ddup (보정 횟수), 링 수위
+//  ② WiFi/BT 공존                → 버림·굶음 카운터를 리셋해 WiFi on/off 로 A/B
+//  ③ AC101 아날로그 게인          → **내부 루프백**으로 잰 무음 노이즈 바닥.
+//                                   HP 볼륨을 63/32/0 으로 바꿔 재면, 값이 볼륨에
+//                                   따라 변하면 볼륨단 이전, 안 변하면 출력단이다.
+//  ④ USB/전원/GND                → 같은 루프백 무음에서 50/60/100/120Hz 동기 검파.
+//                                   여기 선이 서면 전원·접지 문제다(광대역과 구분됨).
+//  ⑤ 언더런/오버런                → starve/drop/aid_overrun 카운터
+//
+// 내부 루프백(ADC_SRC=0x0101)은 mic_scan 에서 찾은 것이다. 톤을 낼 때만 신호가 잡히고
+// 무음에선 방 소리를 안 듣는다 = 코덱 안에서 출력이 입력으로 되돌아오는 경로다.
+// 그래서 **마이크·음향 없이 출력 경로 자체를 전기적으로 계측**할 수 있다.
+
+struct DiagResult {
+    float floor_hi, floor_mid, floor_lo;    // 무음 노이즈 바닥 (HP 볼륨 63/32/0)
+    float hum50, hum60, hum100, hum120;     // 전원 관련 성분
+    float broadband;                        // 광대역 RMS (화이트노이즈 성분)
+    int   lat_samples;                      // 실측 왕복 지연
+};
+static DiagResult g_diag = {0, 0, 0, 0, 0, 0, 0, 0, -1};
+
+// 무음을 내면서 동시에 받아, RMS 와 주어진 주파수들의 동기 검파를 한다.
+static void diag_measure(int ms, float *rms, const float *freqs, float *dets, int nf)
+{
+    static int16_t z[128 * 2], rx[128 * 2];
+    memset(z, 0, sizeof z);
+    double e = 0; uint32_t n = 0, ph = 0;
+    double ip[4] = {0}, qp[4] = {0};
+
+    const uint32_t t_end = millis() + ms;
+    while (millis() < t_end) {
+        size_t w = 0, g = 0;
+        i2s_write(I2S_PORT_JACK, z, sizeof z, &w, portMAX_DELAY);
+        if (i2s_read(I2S_PORT_JACK, rx, sizeof rx, &g, pdMS_TO_TICKS(100)) != ESP_OK) break;
+        const int fr = (int)(g / 4);
+        for (int i = 0; i < fr; i++, ph++) {
+            const double v = rx[2 * i];       // 좌 채널로 판정한다
+            e += v * v; n++;
+            for (int k = 0; k < nf && k < 4; k++) {
+                const double w2 = 2.0 * M_PI * freqs[k] / OUT_HZ * ph;
+                ip[k] += v * cos(w2);
+                qp[k] += v * sin(w2);
+            }
+        }
+    }
+    if (!n) { *rms = 0; return; }
+    *rms = (float)sqrt(e / n);
+    for (int k = 0; k < nf && k < 4; k++)
+        dets[k] = (float)(2.0 * sqrt(ip[k] * ip[k] + qp[k] * qp[k]) / n);
+}
+
+// 임펄스를 내보내 되돌아오는 시점을 찾아 **실측 왕복 지연**을 구한다.
+// 해석적 지연(DMA×2 + 블록)이 맞는지 확인하는 유일한 방법이다.
+static int diag_latency()
+{
+    static int16_t tx[128 * 2], rx[128 * 2];
+
+    // ★ 먼저 비우고 **정적을 확인**한다. 이걸 안 하면 직전에 나던 소리가 DMA 에
+    //   남아 있어서 임펄스가 "0샘플에 도착" 한 것처럼 읽힌다(실제로 그렇게 나왔다).
+    i2s_zero_dma_buffer(I2S_PORT_JACK);
+    size_t w = 0, g0 = 0;
+    memset(tx, 0, sizeof tx);
+    for (int q = 0; q < 12; q++) {                  // 무음을 밀어 넣고 잔향을 흘려보낸다
+        i2s_write(I2S_PORT_JACK, tx, sizeof tx, &w, portMAX_DELAY);
+        i2s_read(I2S_PORT_JACK, rx, sizeof rx, &g0, pdMS_TO_TICKS(100));
+    }
+    int quiet = 0;
+    for (int q = 0; q < 20 && quiet < 3; q++) {      // 연속 3블록이 조용해야 통과
+        i2s_write(I2S_PORT_JACK, tx, sizeof tx, &w, portMAX_DELAY);
+        if (i2s_read(I2S_PORT_JACK, rx, sizeof rx, &g0, pdMS_TO_TICKS(100)) != ESP_OK) break;
+        int mx = 0;
+        for (int i = 0; i < (int)(g0 / 4); i++) { const int a = abs(rx[2 * i]); if (a > mx) mx = a; }
+        quiet = (mx < 800) ? quiet + 1 : 0;
+    }
+    if (quiet < 3) return -2;                        // 조용해지지 않았다 — 측정 포기
+
+    // RX 에 남아 있는 **과거** 샘플을 다 버린다. 이걸 안 하면 임펄스가 그 뒤에
+    // 오는데도 앞쪽 오래된 블록에서 큰 값을 만나 "0샘플" 로 읽힌다.
+    for (int q = 0; q < 8; q++) {
+        size_t gg = 0;
+        if (i2s_read(I2S_PORT_JACK, rx, sizeof rx, &gg, pdMS_TO_TICKS(2)) != ESP_OK || gg == 0) break;
+    }
+
+    for (int i = 0; i < 4; i++) { tx[2 * i] = 20000; tx[2 * i + 1] = 20000; }
+    i2s_write(I2S_PORT_JACK, tx, sizeof tx, &w, portMAX_DELAY);
+    memset(tx, 0, sizeof tx);
+
+    int elapsed = 0;
+    for (int blk = 0; blk < 40; blk++) {
+        size_t g = 0;
+        i2s_write(I2S_PORT_JACK, tx, sizeof tx, &w, portMAX_DELAY);
+        if (i2s_read(I2S_PORT_JACK, rx, sizeof rx, &g, pdMS_TO_TICKS(100)) != ESP_OK) break;
+        const int fr = (int)(g / 4);
+        for (int i = 0; i < fr; i++) {
+            if (abs(rx[2 * i]) > 3000) {
+                const int d = elapsed + i;
+                // 코덱 자체 지연만으로도 몇 샘플은 걸린다. 8샘플 미만은 측정법의
+                // 해상도 아래이므로 값으로 쓰지 않는다(0.00ms 로 보고하던 문제).
+                return (d < 8) ? -3 : d;
+            }
+        }
+        elapsed += fr;
+    }
+    return -1;
+}
+
+static void diag_run()
+{
+    if (!g_codec_ok || g_role != ROLE_PLAYER) { g_diag_busy = false; return; }
+
+    // 상태를 저장해 두고 끝나면 되돌린다
+    const uint16_t sv_src = g_codec.rd(0x51), sv_apc = g_codec.rd(0x50);
+    const ProcMode sv_mode = g_pmode;
+    const int sv_vol = g_vol;
+
+    Serial.println("\n[진단] 시작 — 내부 루프백으로 출력 경로를 전기적으로 잰다");
+    g_codec.wr(0x51, 0x0101);          // 내부 루프백 (mic_scan 에서 확정)
+    delay(150);
+
+    float freqs[4] = {50.0f, 60.0f, 100.0f, 120.0f};
+    float dets[4] = {0, 0, 0, 0};
+    float rms = 0;
+
+    // ③ 아날로그 게인별 노이즈 바닥
+    g_vol = 100; apply_codec_volume(); delay(120);
+    diag_measure(300, &rms, freqs, dets, 0); g_diag.floor_hi = rms;
+    g_vol = 50;  apply_codec_volume(); delay(120);
+    diag_measure(300, &rms, freqs, dets, 0); g_diag.floor_mid = rms;
+    g_vol = 0;   apply_codec_volume(); delay(120);
+    diag_measure(300, &rms, freqs, dets, 0); g_diag.floor_lo = rms;
+
+    // ④ 전원 관련 성분 (볼륨 최대에서 가장 잘 보인다)
+    g_vol = 100; apply_codec_volume(); delay(120);
+    diag_measure(600, &rms, freqs, dets, 4);
+    g_diag.broadband = rms;
+    g_diag.hum50 = dets[0]; g_diag.hum60 = dets[1];
+    g_diag.hum100 = dets[2]; g_diag.hum120 = dets[3];
+
+    // 실측 왕복 지연
+    g_diag.lat_samples = diag_latency();
+
+    g_codec.wr(0x51, sv_src);
+    g_codec.wr(0x50, sv_apc);
+    g_vol = sv_vol; apply_codec_volume();
+    g_pmode = sv_mode;
+    g_diag_busy = false;
+
+    Serial.printf("[진단] 무음 노이즈 바닥 — 볼륨 최대 %.1f / 중간 %.1f / 0 %.1f\n",
+                  g_diag.floor_hi, g_diag.floor_mid, g_diag.floor_lo);
+    Serial.printf("[진단] 전원 성분 — 50Hz %.2f · 60Hz %.2f · 100Hz %.2f · 120Hz %.2f / 광대역 %.1f\n",
+                  g_diag.hum50, g_diag.hum60, g_diag.hum100, g_diag.hum120, g_diag.broadband);
+    if (g_diag.lat_samples >= 0)
+        Serial.printf("[진단] 실측 왕복 지연 %d 샘플 = %.2fms (해석 %.1fms)\n",
+                      g_diag.lat_samples, g_diag.lat_samples * 1000.0f / OUT_HZ, g_lat_ms);
+    else
+        Serial.println("[진단] 왕복 지연: 임펄스가 돌아오지 않았다");
+
+    // 판정 도우미 — 숫자만 주면 사람이 또 해석해야 한다
+    const float scale = (g_diag.floor_lo > 0) ? g_diag.floor_hi / g_diag.floor_lo : 0;
+    Serial.printf("[진단] 해석: 노이즈 바닥이 볼륨에 따라 %.1f배 변한다 → %s\n", scale,
+                  scale > 2.0f ? "볼륨단 **이전**(디지털·DAC)에서 생긴다"
+                               : "볼륨단 **이후**(출력 스테이지·전원)에서 생긴다");
+    const float hum = max(max(g_diag.hum50, g_diag.hum60), max(g_diag.hum100, g_diag.hum120));
+    Serial.printf("[진단] 해석: hum 최대 %.2f vs 광대역 %.1f → %s\n", hum, g_diag.broadband,
+                  (g_diag.broadband > 0 && hum > g_diag.broadband * 0.3f)
+                      ? "전원/접지 성분이 지배적이다(USB 전원을 바꿔 볼 것)"
+                      : "광대역(화이트노이즈)이 지배적이다 — 아날로그 바닥");
+}
+
 // ─────────────────────────────────────────────────────────────── 웹 API
 
 static const char *state_name()
@@ -1225,6 +1608,36 @@ static void api_status()
     j += "\"src\":\""; j += String(g_src_hz) + "Hz/" + String(g_src_ch) + "ch/" + String(g_bitrate) + "k"; j += "\",";
     j += "\"under\":"; j += String((unsigned)g_underruns); j += ",";
     j += "\"heap\":"; j += String((unsigned)ESP.getFreeHeap()); j += ",";
+    // 실시간 처리 모드 · 파라미터 · 계측값
+    j += "\"pmode\":\""; j += (g_pmode == PM_HEARING ? "hearing" : (g_pmode == PM_NR ? "nr" : "normal")); j += "\",";
+    j += "\"speechgain\":"; j += String((int)g_speech_gain_db); j += ",";
+    j += "\"nrstrength\":"; j += String((int)g_nr_strength); j += ",";
+    j += "\"outgain\":"; j += String((int)g_out_gain); j += ",";
+    j += "\"beam\":"; j += String((int)g_beam); j += ",";
+    j += "\"beamdelay\":"; j += String((int)g_beam_delay); j += ",";
+    j += "\"latms\":"; j += String(g_lat_ms, 1); j += ",";
+    j += "\"latmeas\":"; j += String(g_lat_meas >= 0 ? g_lat_meas * 1000.0f / OUT_HZ : -1.0f, 2); j += ",";
+    j += "\"mRaw\":"; j += String((int)g_m_raw); j += ",";
+    j += "\"beamdb\":"; j += String(g_m_beam_db, 1); j += ",";
+    j += "\"mIn\":"; j += String((int)g_m_in); j += ",";
+    j += "\"mNoise\":"; j += String((int)g_m_noise); j += ",";
+    j += "\"mOut\":"; j += String((int)g_m_out); j += ",";
+    j += "\"nrdb\":"; j += String(g_m_nr_db, 1); j += ",";
+    j += "\"aidblk\":"; j += String((unsigned)g_aid_blocks); j += ",";
+    j += "\"aidover\":"; j += String((unsigned)g_aid_overruns); j += ",";
+    // 진단 결과 (마지막 실행)
+    j += "\"diag\":{";
+    j += "\"busy\":"; j += g_diag_busy ? "true," : "false,";
+    j += "\"floorHi\":" + String(g_diag.floor_hi, 1) + ",";
+    j += "\"floorMid\":" + String(g_diag.floor_mid, 1) + ",";
+    j += "\"floorLo\":" + String(g_diag.floor_lo, 1) + ",";
+    j += "\"hum50\":" + String(g_diag.hum50, 2) + ",";
+    j += "\"hum60\":" + String(g_diag.hum60, 2) + ",";
+    j += "\"hum100\":" + String(g_diag.hum100, 2) + ",";
+    j += "\"hum120\":" + String(g_diag.hum120, 2) + ",";
+    j += "\"bb\":" + String(g_diag.broadband, 1) + ",";
+    j += "\"latSamples\":" + String(g_diag.lat_samples);
+    j += "},";
     j += "\"recpeak\":"; j += String((int)g_rec_peak); j += ",";
     j += "\"micvol\":\""; { char b[10]; snprintf(b, sizeof b, "0x%04X", g_mic_vol); j += b; } j += "\",";
     j += "\"rec\":"; j += g_rec ? "true," : "false,";
@@ -1499,6 +1912,61 @@ static void http_setup()
         char b[40]; snprintf(b, sizeof b, "ADC_VOL_CTRL=0x%04X", g_mic_vol);
         g_http.send(200, "text/plain", b);
     });
+    // 처리 모드 전환. 즉시 반응해야 하므로 재부팅하지 않고 I2S 만 다시 설치한다.
+    g_http.on("/api/mode", HTTP_POST, [] {
+        if (g_role != ROLE_PLAYER) { g_http.send(409, "text/plain", "플레이어 역할에서만 된다"); return; }
+        const String m = g_http.arg("m");
+        const int want = (m == "hearing") ? PM_HEARING : (m == "nr") ? PM_NR : PM_NORMAL;
+        if (want != PM_NORMAL) cmd_stop();          // 재생과 동시에 쓰지 않는다
+        g_mode_req = want;
+        g_prefs.putInt("pmode", want);
+        g_http.send(200, "text/plain", "ok");
+    });
+
+    // 보청기 파라미터. 하나만 보내도 되고 여러 개 같이 보내도 된다.
+    g_http.on("/api/aid", HTTP_POST, [] {
+        if (g_http.hasArg("speech")) g_speech_gain_db = constrain(g_http.arg("speech").toInt(), 0, 24);
+        if (g_http.hasArg("nr"))     g_nr_strength    = constrain(g_http.arg("nr").toInt(), 0, 100);
+        if (g_http.hasArg("gain"))   g_out_gain       = constrain(g_http.arg("gain").toInt(), 50, 400);
+        if (g_http.hasArg("beam"))   g_beam           = constrain(g_http.arg("beam").toInt(), 0, 1);
+        if (g_http.hasArg("bd"))     g_beam_delay     = constrain(g_http.arg("bd").toInt(), 0, BEAM_MAX_D);
+        g_prefs.putInt("speech", g_speech_gain_db);
+        g_prefs.putInt("nrs", g_nr_strength);
+        g_prefs.putInt("ogain", g_out_gain);
+        aid_reset();                                 // 계수를 다시 계산한다
+        g_http.send(200, "text/plain", "ok");
+    });
+
+    // 노이즈 원인 분리 진단. 약 2.5초 걸리고 그 동안 소리가 잠깐 멈춘다.
+    g_http.on("/api/diag", HTTP_POST, [] {
+        if (g_role != ROLE_PLAYER) { g_http.send(409, "text/plain", "플레이어 역할에서만 된다"); return; }
+        if (g_diag_busy) { g_http.send(429, "text/plain", "이미 돌고 있다"); return; }
+        const ProcMode sv = g_pmode;
+        cmd_stop();
+        // I2S 배타 소유를 확보한다: 먼저 깃발을 세우고 jack/aid 가 손을 뗄 때까지 기다린다.
+        g_diag_busy = true;
+        g_jack_idle = false;
+        for (int i = 0; i < 100 && !g_jack_idle; i++) delay(10);
+        diag_run();
+        g_lat_meas = g_diag.lat_samples;
+        if (sv != PM_NORMAL) g_mode_req = sv;        // 원래 모드로 되돌린다
+        g_http.send(200, "text/plain", "ok");
+    });
+
+    // 카운터 리셋 — WiFi on/off 처럼 조건을 바꿔 A/B 하려면 필요하다.
+    g_http.on("/api/statreset", HTTP_POST, [] {
+        g_starves = g_sink_drops = g_drift_skip = g_drift_dup = 0;
+        g_underruns = g_aid_overruns = 0;
+        g_sink_bytes = 0;
+        g_http.send(200, "text/plain", "카운터 초기화");
+    });
+
+    // 스트리밍 중 WiFi 자동 차단을 끄고 켠다(공존 영향 A/B 용).
+    g_http.on("/api/wifiaudio", HTTP_POST, [] {
+        g_wifi_off_audio = (g_http.arg("on") == "1");
+        g_http.send(200, "text/plain", g_wifi_off_audio ? "스트리밍 중 WiFi 차단 켬" : "끔");
+    });
+
     g_http.on("/api/rec", HTTP_POST, [] {
         const bool on = (g_http.arg("on") == "1");
         if (on) {
@@ -1705,6 +2173,9 @@ void setup()
     g_out = (OutMode)g_prefs.getInt("out", (int)OUT_BT);
     g_role = (Role)g_prefs.getInt("role", (int)ROLE_PLAYER);
     g_mic_vol = (uint16_t)g_prefs.getInt("micvol", 0xa0a0);
+    g_speech_gain_db = g_prefs.getInt("speech", 8);
+    g_nr_strength = g_prefs.getInt("nrs", 70);
+    g_out_gain = g_prefs.getInt("ogain", 100);
     // 싱크는 기본 볼륨을 높게 둔다. 디지털은 풀스케일로 흘리고 크기는 아날로그와
     // 맥의 AVRCP 볼륨으로 조절하는 것이 잡음이 가장 적다.
     if (g_role == ROLE_SINK) g_vol = g_prefs.getInt("vol", 85);
@@ -1753,6 +2224,11 @@ void setup()
     if (g_codec_ok) xTaskCreatePinnedToCore(jack_task, "jack", 4096, nullptr, 6, nullptr, 1);
     if (g_codec_ok && g_role == ROLE_PLAYER)
         xTaskCreatePinnedToCore(rec_task, "rec", 4096, nullptr, 4, nullptr, 1);
+    // 보청기는 지연이 생명이라 우선순위를 가장 높게 준다.
+    if (g_codec_ok && g_role == ROLE_PLAYER) {
+        aid_reset();
+        xTaskCreatePinnedToCore(aid_task, "aid", 6144, nullptr, 7, nullptr, 1);
+    }
 
     // 초기화가 끝난 뒤의 내부 힙이 진짜 여유다. 여기가 20KB 밑으로 떨어지면
     // 재생을 걸었을 때 파일 열기에서 죽는다 — 실제로 한 번 그렇게 죽었다.
@@ -1774,6 +2250,20 @@ void loop()
         Serial.println("[wifi] 스트리밍 멈춤 — WiFi 를 되살린다");
         wifi_setup();
         g_http.begin();
+    }
+
+    // 보청기/잡음억제 모드의 계측값을 주기적으로 찍는다.
+    if (g_pmode != PM_NORMAL) {
+        static uint32_t last_aid = 0;
+        if (millis() - last_aid > 2000) {
+            last_aid = millis();
+            Serial.printf("[%s] raw %.0f → 빔 %.0f(%.1fdB) → NLMS(%.1fdB) → 출력 %.0f · 잡음기준 %.0f · "
+                          "지연 %.1fms(실측 %s) · 블록 %u · 오버런 %u\n",
+                          g_pmode == PM_HEARING ? "보청기" : "잡음억제",
+                          g_m_raw, g_m_in, g_m_beam_db, g_m_nr_db, g_m_out, g_m_noise, g_lat_ms,
+                          g_lat_meas >= 0 ? String(g_lat_meas * 1000.0f / OUT_HZ, 2).c_str() : "미측정",
+                          (unsigned)g_aid_blocks, (unsigned)g_aid_overruns);
+        }
     }
 
     // 싱크 상태를 시리얼로 주기적으로 찍는다 — WiFi 가 꺼져 있어도 이걸로 계측한다.
