@@ -764,8 +764,11 @@ static void jack_task(void *)
 
             size_t have = ring_used();
             have -= have % 4;
-            if (have < want) {                  // 굶었다 — 무음을 내고 다시 채운다
-                g_starves++;
+            if (have < want) {
+                // ★ 굶음은 **소리를 낼 의무가 있을 때만** 센다. 아무것도 재생하지
+                //   않는 동안 빈 링을 세면 순식간에 100만이 넘고, 그러면 이 숫자로
+                //   원인을 짚을 수 없다(실제로 1,040,656 이 찍혀서 고쳤다).
+                if (g_state == ST_PLAY || g_bt_stream) g_starves++;
                 if (have == 0) g_prebuf = false;
                 memset(g_i2s_buf, 0, want);
                 size_t w0 = 0;
