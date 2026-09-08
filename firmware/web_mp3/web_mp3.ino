@@ -42,6 +42,7 @@
 #include <esp_bt_device.h>
 #include <esp_gap_bt_api.h>
 #include <esp_a2dp_api.h>
+#include <esp_avrc_api.h>
 #include <esp_heap_caps.h>
 #include <Wire.h>
 #include <AC101.h>
@@ -278,6 +279,42 @@ static void a2dp_sink_data_cb(const uint8_t *data, uint32_t len)
     g_sk_prev_r = (ch == 2) ? in[2 * (n - 1) + 1] : g_sk_prev_l;
 }
 
+// ── AVRCP 컨트롤러: 싱크가 **상대(맥)의 재생을 조작한다**.
+//
+// BT 스피커의 버튼이 폰·맥의 재생/다음곡을 움직이는 게 바로 이 프로파일이다.
+// 트랜잭션 라벨은 0~15 를 돌려 쓴다.
+static uint8_t g_tl = 0;
+static bool    g_remote_playing = true;
+
+static void avrc_send(uint8_t key)
+{
+    const uint8_t tl = g_tl++ & 0x0F;
+    esp_avrc_ct_send_passthrough_cmd(tl, key, ESP_AVRC_PT_CMD_STATE_PRESSED);
+    vTaskDelay(pdMS_TO_TICKS(30));
+    esp_avrc_ct_send_passthrough_cmd(tl, key, ESP_AVRC_PT_CMD_STATE_RELEASED);
+}
+
+static void avrc_cmd(const String &c)
+{
+    if (g_role != ROLE_SINK) return;
+    if (c == "next")       avrc_send(ESP_AVRC_PT_CMD_FORWARD);
+    else if (c == "prev")  avrc_send(ESP_AVRC_PT_CMD_BACKWARD);
+    else if (c == "stop")  avrc_send(ESP_AVRC_PT_CMD_STOP);
+    else if (c == "play")  { avrc_send(ESP_AVRC_PT_CMD_PLAY);  g_remote_playing = true; }
+    else if (c == "pause") { avrc_send(ESP_AVRC_PT_CMD_PAUSE); g_remote_playing = false; }
+    else if (c == "toggle") {
+        avrc_send(g_remote_playing ? ESP_AVRC_PT_CMD_PAUSE : ESP_AVRC_PT_CMD_PLAY);
+        g_remote_playing = !g_remote_playing;
+    }
+    Serial.printf("[avrc] %s\n", c.c_str());
+}
+
+static void avrc_ct_cb(esp_avrc_ct_cb_event_t ev, esp_avrc_ct_cb_param_t *p)
+{
+    if (ev == ESP_AVRC_CT_CONNECTION_STATE_EVT)
+        Serial.printf("[avrc] %s\n", p->conn_stat.connected ? "연결됨 — 버튼이 맥을 조작한다" : "끊김");
+}
+
 static void a2dp_cb(esp_a2d_cb_event_t ev, esp_a2d_cb_param_t *p)
 {
     // 싱크가 협상한 코덱 설정. SBC 헤더에서 샘플레이트·채널을 꺼낸다.
@@ -422,6 +459,10 @@ static void bt_setup()
         cod.minor = 0x06;                      // Headphones (맥에서 헤드폰 아이콘으로 보인다)
         cod.service = ESP_BT_COD_SRVC_AUDIO | ESP_BT_COD_SRVC_RENDERING;
         esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
+
+        // AVRCP 컨트롤러도 올린다 — 이걸로 보드의 버튼이 맥의 재생을 조작한다.
+        esp_avrc_ct_init();
+        esp_avrc_ct_register_callback(avrc_ct_cb);
 
         g_out = OUT_JACK;                      // 싱크의 소리는 잭으로 낸다
         Serial.println("[a2dp] **싱크(BT 스피커)** 모드 — 맥·폰에서 스캔해 연결하라");
@@ -1144,6 +1185,10 @@ static void http_setup()
         cmd_out(g_http.arg("m") == "jack" ? OUT_JACK : OUT_BT);
         g_http.send(200, "text/plain", "ok");
     });
+    g_http.on("/api/avrc", HTTP_POST, [] {
+        avrc_cmd(g_http.arg("c"));
+        g_http.send(200, "text/plain", g_role == ROLE_SINK ? "ok" : "싱크 모드에서만 동작한다");
+    });
     g_http.on("/api/pa", HTTP_POST, [] {
         const bool on = (g_http.arg("on") == "1");
         digitalWrite(PIN_PA, on ? HIGH : LOW);
@@ -1242,7 +1287,7 @@ static void keys_setup()
     //   아날로그 전원에 노이즈를 얹어 헤드폰 잭 쪽 잡음이 커진다. 스피커를 쓸 때만
     //   /api/pa?on=1 로 켠다.
     digitalWrite(PIN_PA, LOW);
-    digitalWrite(PIN_LED_G, HIGH);   // 전원 표시로 그냥 켜 둔다(깜빡이지 않는다)
+    digitalWrite(PIN_LED_G, HIGH);   // 초록 LED. 상태 표시로 쓴다(led_status() 참고)
     for (auto &k : g_keys) pinMode(k.pin, k.pin == 36 ? INPUT : INPUT_PULLUP);   // 36 은 입력 전용(내부 풀업 없음)
 }
 
@@ -1254,6 +1299,19 @@ static void keys_poll()
         const bool lvl = digitalRead(k.pin);            // 눌리면 LOW
         if (k.prev && !lvl) { k.down_at = now; k.longsent = false; }
         else if (!k.prev && lvl && now - k.down_at > 30 && !k.longsent) {
+            // 싱크 모드에서는 같은 버튼이 **맥의 재생**을 움직인다(AVRCP).
+            if (g_role == ROLE_SINK) {
+                switch (k.pin) {
+                case KEY_PLAY: avrc_cmd("toggle"); break;
+                case KEY_NEXT: avrc_cmd("next");   break;
+                case KEY_PREV: avrc_cmd("prev");   break;
+                case KEY_VUP:  cmd_vol(g_vol + 5); break;
+                case KEY_VDN:  cmd_vol(g_vol - 5); break;
+                }
+                Serial.printf("[key] GPIO%d\n", k.pin);
+                k.prev = lvl;
+                continue;
+            }
             switch (k.pin) {                            // 짧게 눌렀을 때
             case KEY_PLAY: cmd_toggle(); break;
             case KEY_NEXT: cmd_step(+1); break;
@@ -1279,9 +1337,23 @@ static void keys_poll()
     }
 }
 
-// 상태 표시를 위해 GPIO22 를 깜빡이는 짓은 하지 않는다 — 그 핀이 앰프 인에이블일
-// 수 있고, 그러면 소리를 끊어 놓고 "안 들린다" 는 판정을 내리게 된다.
-// 상태는 웹 UI 와 시리얼로 본다.
+// 초록 LED(GPIO22)로 상태를 보여준다.
+//
+// 한때 이 핀을 PA_ENABLE 로 의심해 깜빡임을 다 뺐는데, 실측으로 판정됐다 —
+// loopback_test 에서 GPIO22 를 LOW/HIGH 로 바꿔도 출력 검파값이 그대로였다(비 0.85).
+// 앰프는 GPIO21 이고 22 는 LED 다. 그래서 다시 상태 표시로 쓴다.
+//
+// 파란 LED(GPIO19)는 **KEY3 과 핀을 공유한다** — LED 로 쓰면 이전곡 버튼이 죽는다.
+// 그래서 건드리지 않는다.
+static void led_status()
+{
+    //  켜짐        = 소리가 실제로 흐르는 중 (스트리밍 또는 잭 재생)
+    //  느린 깜빡임 = 연결됨/대기
+    //  빠른 깜빡임 = 미연결
+    const bool flowing = g_bt_stream || (g_out == OUT_JACK && g_state == ST_PLAY);
+    const uint32_t p = flowing ? 0 : (g_bt_conn ? 1000 : 250);
+    digitalWrite(PIN_LED_G, p == 0 ? HIGH : ((millis() / p) & 1));
+}
 
 // ─────────────────────────────────────────────────────────────── setup / loop
 
@@ -1380,5 +1452,6 @@ void loop()
 
     g_http.handleClient();
     keys_poll();
+    led_status();
     delay(2);
 }
