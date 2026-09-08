@@ -72,7 +72,23 @@ progress{width:100%;height:5px}
 
 <div class="card">
   <div class="row spread" style="margin-bottom:8px">
-    <h2 style="margin:0">블루투스 출력</h2>
+    <h2 style="margin:0">출력 경로</h2>
+    <span id="outst" class="pill">…</span>
+  </div>
+  <div class="row">
+    <button id="ob" onclick="api('/api/out?m=bt')">블루투스 (A2DP)</button>
+    <button id="oj" onclick="api('/api/out?m=jack')">3.5mm 잭</button>
+    <button onclick="api('/api/tone?s=5')">잭 테스트음 5초</button>
+  </div>
+  <div class="note">잭이 살아 있는지는 <b>아직 아무도 확인한 적이 없다</b>. 기존 판정은 마이크로
+  듣는 방식이었고 그 방법은 입력이 죽으면 출력이 살아 있어도 실패한다. 확정된 건 입력(ADC)이
+  정확히 0 이라는 것뿐. <b>이어폰을 꽂고 테스트음을 눌러라</b> — 들리면 잭 출력이 살아 있다.
+  안 들리면 가운데 DIP 스위치를 하나씩 토글하면서 다시 눌러 봐라.</div>
+</div>
+
+<div class="card">
+  <div class="row spread" style="margin-bottom:8px">
+    <h2 style="margin:0">블루투스 기기</h2>
     <span id="btst" class="pill">…</span>
   </div>
   <div class="row">
@@ -112,7 +128,7 @@ progress{width:100%;height:5px}
   <h2>버튼 6개</h2>
   <div class="keys">
     <div><b>KEY1</b> 재생/정지</div><div><b>KEY2</b> 다음곡</div><div><b>KEY3</b> 이전곡</div>
-    <div><b>KEY4</b> 음량+</div><div><b>KEY5</b> 음량−</div><div><b>KEY6</b> BT 재연결<br>(길게=탐색)</div>
+    <div><b>KEY4</b> 음량+<br>(길게=테스트음)</div><div><b>KEY5</b> 음량−<br>(길게=출력전환)</div><div><b>KEY6</b> BT 재연결<br>(길게=탐색)</div>
   </div>
 </div>
 
@@ -146,6 +162,11 @@ async function tick(){
   $('pb').style.width = (s.pct||0)+'%';
   $('ela').textContent = mmss(s.elapsed); $('tot').textContent = s.duration?mmss(s.duration):'—:—';
   if(!dragVol){ $('vol').value=s.vol; $('vlab').textContent=s.vol; }
+
+  const jack = s.out=='jack';
+  $('outst').textContent = (jack?'잭':'블루투스') + (s.tone?' · 테스트음 재생중':'') + (s.jackok?'':' · AC101 없음');
+  $('outst').className='pill '+(s.tone?'warn':'ok');
+  $('ob').className = jack?'':'p'; $('oj').className = jack?'p':'';
 
   $('btst').textContent = s.bt.state; $('btst').className='pill '+(s.bt.streaming?'ok':s.bt.connected?'warn':'bad');
   $('btlist').innerHTML = s.bt.devices.length? s.bt.devices.map(d=>

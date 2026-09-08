@@ -10,6 +10,10 @@
 
 enum PState { ST_IDLE, ST_PLAY, ST_PAUSE };
 
+// 출력 경로. "둘 다 동시" 는 없다 — I2S 와 A2DP 는 클록 도메인이 달라서
+// 링버퍼 소비자가 둘이 되면 드리프트를 흡수할 곳이 없다.
+enum OutMode { OUT_BT, OUT_JACK };
+
 struct Track {
     String name;
     String path;

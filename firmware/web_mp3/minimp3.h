@@ -7,6 +7,7 @@
     See <http://creativecommons.org/publicdomain/zero/1.0/>.
 */
 #include <stdint.h>
+#include <stddef.h>
 
 #define MINIMP3_MAX_SAMPLES_PER_FRAME (1152*2)
 
@@ -27,6 +28,15 @@ extern "C" {
 #endif /* __cplusplus */
 
 void mp3dec_init(mp3dec_t *dec);
+/* 로컬 개조 (ESP32): 프레임 스크래치를 스택에서 뺀다.
+   원본은 mp3dec_decode_frame() 안에 mp3dec_scratch_t 를 스택으로 잡는데 그게 16KB 를
+   넘는다. ESP32 에서 6KB 스택 태스크로 부르면 "Stack canary watchpoint triggered" 로
+   즉사한다(실측). 내부 DRAM 이 27KB 밖에 안 남는 구성이라 스택만 키울 수도 없어서,
+   호출 전에 PSRAM 버퍼를 한 번 물려 준다:
+       mp3dec_set_scratch(ps_malloc(mp3dec_scratch_size()));
+   디코더를 부르는 태스크가 하나라는 전제다(스크래치를 공유하므로). */
+void   mp3dec_set_scratch(void *buf);
+size_t mp3dec_scratch_size(void);
 #ifndef MINIMP3_FLOAT_OUTPUT
 typedef int16_t mp3d_sample_t;
 #else /* MINIMP3_FLOAT_OUTPUT */
@@ -237,6 +247,11 @@ typedef struct
     float grbuf[2][576], scf[40], syn[18 + 15][2*32];
     uint8_t ist_pos[2][39];
 } mp3dec_scratch_t;
+
+/* 로컬 개조: 스크래치를 밖에서 받는다. 위 선언부의 주석 참고. */
+static mp3dec_scratch_t *s_minimp3_scratch = NULL;
+void   mp3dec_set_scratch(void *buf) { s_minimp3_scratch = (mp3dec_scratch_t *)buf; }
+size_t mp3dec_scratch_size(void)     { return sizeof(mp3dec_scratch_t); }
 
 static void bs_init(bs_t *bs, const uint8_t *data, int bytes)
 {
@@ -1715,7 +1730,8 @@ int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_s
     int i = 0, igr, frame_size = 0, success = 1;
     const uint8_t *hdr;
     bs_t bs_frame[1];
-    mp3dec_scratch_t scratch;
+    mp3dec_scratch_t *scratch = s_minimp3_scratch;
+    if (!scratch) return 0;   /* mp3dec_set_scratch() 를 먼저 불러야 한다 */
 
     if (mp3_bytes > 4 && dec->header[0] == 0xff && hdr_compare(dec->header, mp3))
     {
@@ -1758,23 +1774,23 @@ int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_s
 
     if (info->layer == 3)
     {
-        int main_data_begin = L3_read_side_info(bs_frame, scratch.gr_info, hdr);
+        int main_data_begin = L3_read_side_info(bs_frame, scratch->gr_info, hdr);
         if (main_data_begin < 0 || bs_frame->pos > bs_frame->limit)
         {
             mp3dec_init(dec);
             return 0;
         }
-        success = L3_restore_reservoir(dec, bs_frame, &scratch, main_data_begin);
+        success = L3_restore_reservoir(dec, bs_frame, scratch, main_data_begin);
         if (success)
         {
             for (igr = 0; igr < (HDR_TEST_MPEG1(hdr) ? 2 : 1); igr++, pcm += 576*info->channels)
             {
-                memset(scratch.grbuf[0], 0, 576*2*sizeof(float));
-                L3_decode(dec, &scratch, scratch.gr_info + igr*info->channels, info->channels);
-                mp3d_synth_granule(dec->qmf_state, scratch.grbuf[0], 18, info->channels, pcm, scratch.syn[0]);
+                memset(scratch->grbuf[0], 0, 576*2*sizeof(float));
+                L3_decode(dec, scratch, scratch->gr_info + igr*info->channels, info->channels);
+                mp3d_synth_granule(dec->qmf_state, scratch->grbuf[0], 18, info->channels, pcm, scratch->syn[0]);
             }
         }
-        L3_save_reservoir(dec, &scratch);
+        L3_save_reservoir(dec, scratch);
     } else
     {
 #ifdef MINIMP3_ONLY_MP3
@@ -1783,15 +1799,15 @@ int mp3dec_decode_frame(mp3dec_t *dec, const uint8_t *mp3, int mp3_bytes, mp3d_s
         L12_scale_info sci[1];
         L12_read_scale_info(hdr, bs_frame, sci);
 
-        memset(scratch.grbuf[0], 0, 576*2*sizeof(float));
+        memset(scratch->grbuf[0], 0, 576*2*sizeof(float));
         for (i = 0, igr = 0; igr < 3; igr++)
         {
-            if (12 == (i += L12_dequantize_granule(scratch.grbuf[0] + i, bs_frame, sci, info->layer | 1)))
+            if (12 == (i += L12_dequantize_granule(scratch->grbuf[0] + i, bs_frame, sci, info->layer | 1)))
             {
                 i = 0;
-                L12_apply_scf_384(sci, sci->scf + igr, scratch.grbuf[0]);
-                mp3d_synth_granule(dec->qmf_state, scratch.grbuf[0], 12, info->channels, pcm, scratch.syn[0]);
-                memset(scratch.grbuf[0], 0, 576*2*sizeof(float));
+                L12_apply_scf_384(sci, sci->scf + igr, scratch->grbuf[0]);
+                mp3d_synth_granule(dec->qmf_state, scratch->grbuf[0], 12, info->channels, pcm, scratch->syn[0]);
+                memset(scratch->grbuf[0], 0, 576*2*sizeof(float));
                 pcm += 384*info->channels;
             }
             if (bs_frame->pos > bs_frame->limit)

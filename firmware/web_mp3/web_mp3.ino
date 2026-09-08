@@ -43,6 +43,9 @@
 #include <esp_gap_bt_api.h>
 #include <esp_a2dp_api.h>
 #include <esp_heap_caps.h>
+#include <Wire.h>
+#include <AC101.h>
+#include <driver/i2s.h>
 
 #include "minimp3.h"
 #include "player.h"
@@ -66,6 +69,13 @@ static const char *BT_NAME = "KETI-MP3";
 
 static const int OUT_HZ = 44100;   // A2DP 표준. 여기로 맞춰 리샘플한다.
 
+// 잭 출력(AC101 + I2S). 44100 을 벗어나면 AC101 PLL 이 락을 잃는다 — 우연히
+// A2DP 와 같은 레이트라 리샘플러 하나로 두 출력을 다 먹인다.
+static const i2s_port_t I2S_PORT_JACK = I2S_NUM_0;
+static const int PIN_MCLK = 0, PIN_BCLK = 27, PIN_LRCK = 25, PIN_DOUT = 26;
+static const int PIN_SDA = 33, PIN_SCL = 32;
+static const int I2S_BLOCK = 256;   // 프레임
+
 // ─────────────────────────────────────────────────────────────── 링버퍼 (PSRAM)
 
 // 2의 거듭제곱으로 잡아 마스킹으로 감싼다. 256KB = 스테레오 16비트 44.1kHz 로 약 1.48초.
@@ -87,7 +97,8 @@ static inline void   ring_reset() { g_rd = g_wr = 0; }
 static volatile PState g_state = ST_IDLE;
 static volatile bool   g_req_stop = false;      // 디코더에게 현재 곡을 접으라고 알린다
 static volatile int    g_req_track = -1;        // >=0 이면 그 인덱스로 전환
-static volatile int    g_vol = 60;              // 0~100, A2DP 콜백에서 적용(즉시 반응)
+static volatile int    g_vol = 60;              // 0~100, 출력단에서 적용(즉시 반응)
+static volatile OutMode g_out = OUT_BT;         // 소리를 어디로 낼지
 static volatile bool   g_busy_fs = false;       // 업로드/다운로드 중 — 재생을 양보한다
 
 static std::vector<Track> g_lib;
@@ -151,6 +162,10 @@ static const char *cod_major_name(uint8_t m)
 static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
 {
     if (!buf || len <= 0) return 0;
+
+    // 잭 모드일 때는 링을 건드리지 않는다. 소비자가 둘이 되면 서로 프레임을 뺏는다
+    // (이어폰이 아직 연결돼 스트리밍 중일 수 있으므로 이 방어가 필요하다).
+    if (g_out != OUT_BT) { memset(buf, 0, (size_t)len); return len; }
 
     size_t want = (size_t)len;
     size_t have = ring_used();
@@ -262,6 +277,12 @@ static void gap_cb(esp_bt_gap_cb_event_t ev, esp_bt_gap_cb_param_t *p)
 
 static void bt_setup()
 {
+    // BLE 몫의 컨트롤러 메모리를 반납한다. 이 펌웨어는 클래식 BT(A2DP)만 쓰는데
+    // 안 반납하면 내부 DRAM 을 30~40KB 쥐고 앉아 있다. 실측으로 이게 결정적이었다 —
+    // 반납 전에는 초기화가 끝난 뒤 남는 힙이 14KB 였고 재생을 걸면 죽었다.
+    // **btStart() 보다 먼저** 불러야 한다(컨트롤러가 올라간 뒤에는 안 먹는다).
+    esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+
     Serial.printf("[bt] 컨트롤러 상태 %d → btStart()\n", (int)esp_bt_controller_get_status());
     // btStart() 를 써야 한다. esp_bt_controller_init() 직접 호출은 상태가 IDLE 로
     // 읽히는데도 ESP_ERR_INVALID_STATE 를 돌려준다(모드 지정·mem_release 제거 다 실패).
@@ -301,6 +322,118 @@ static void bt_scan_start()
 {
     g_bt_devs.clear();
     esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10 /*×1.28초 ≈ 12.8초*/, 0);
+}
+
+// ─────────────────────────────────────────────────────────────── 잭 출력 (AC101 + I2S)
+//
+// 잭이 살아 있는지는 이 저장소에 기록이 없다. 판정 근거였던 음향 폐루프는 **입력이
+// 죽으면 출력이 살아 있어도 똑같이 실패**하고, 보드에 스피커가 안 붙어 있어서
+// 아무도 이어폰을 꽂고 들어본 적이 없다. 확정된 건 입력(ADC)이 정확히 0 이라는 것뿐.
+//
+// 그래서 잭을 **정식 출력 경로로 넣어 둔다.** 살아 있으면 그 자리에서 되고, 죽어 있어도
+// 블루투스 경로가 그대로다. 어느 쪽이든 이 펌웨어는 완성품이다.
+//
+// "둘 다 동시" 는 일부러 넣지 않았다. I2S 와 A2DP 는 클록 도메인이 달라서 한쪽이
+// 천천히 밀리고, 링버퍼 소비자가 둘이 되면 드리프트를 흡수할 곳이 없다.
+
+class AC101Ex : public AC101 {
+public:
+    uint16_t rd(uint8_t r) { return ReadReg(r); }
+    bool wr(uint8_t r, uint16_t v) { return WriteReg(r, v); }
+};
+
+static AC101Ex g_codec;
+static bool     g_codec_ok = false;
+static int16_t *g_i2s_buf = nullptr;
+static volatile uint32_t g_tone_until = 0;     // 이 시각까지 테스트음을 낸다
+static volatile uint64_t g_i2s_frames = 0;     // I2S 로 실제로 밀어낸 프레임 수
+static float g_tone_phase = 0.0f;
+
+static void jack_setup()
+{
+    // AC101 은 I2C 로는 늘 완벽하게 대답한다 — 지금까지 한 번도 실패한 적 없다.
+    g_codec_ok = g_codec.begin(PIN_SDA, PIN_SCL);
+    if (!g_codec_ok) {
+        Serial.println("[잭] AC101 begin() 실패 — 잭 출력을 쓸 수 없다");
+        return;
+    }
+    g_codec.SetMode(AC101::MODE_DAC);           // 출력만 연다. 죽은 ADC 는 건드리지 않는다
+    g_codec.SetVolumeHeadphone(50);
+    g_codec.SetVolumeSpeaker(50);
+
+    i2s_config_t cfg = {};
+    cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    cfg.sample_rate = OUT_HZ;
+    cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    cfg.dma_buf_count = 4;      // 4×256프레임 ≈ 23ms. 내부 DRAM 이 빡빡해서 6 에서 줄였다
+    cfg.dma_buf_len = I2S_BLOCK;
+    cfg.use_apll = false;
+    cfg.tx_desc_auto_clear = true;
+    if (i2s_driver_install(I2S_PORT_JACK, &cfg, 0, nullptr) != ESP_OK) {
+        Serial.println("[잭] I2S 설치 실패");
+        g_codec_ok = false;
+        return;
+    }
+    i2s_pin_config_t pins = {};
+    pins.mck_io_num = PIN_MCLK;
+    pins.bck_io_num = PIN_BCLK;
+    pins.ws_io_num = PIN_LRCK;
+    pins.data_out_num = PIN_DOUT;
+    pins.data_in_num = I2S_PIN_NO_CHANGE;       // 입력을 아예 만들지 않는다
+    i2s_set_pin(I2S_PORT_JACK, &pins);
+
+    // IRAM 은 16비트 접근이 불법이다(LoadStoreError). DMA 가능 메모리로 잡는다.
+    g_i2s_buf = (int16_t *)heap_caps_malloc((size_t)I2S_BLOCK * 2 * sizeof(int16_t), MALLOC_CAP_DMA);
+    if (!g_i2s_buf) { Serial.println("[잭] DMA 버퍼 실패"); g_codec_ok = false; return; }
+
+    Serial.printf("[잭] 준비됨 — HPOUT=0x%04X SPKOUT=0x%04X DAC_VOL=0x%04X\n",
+                  g_codec.rd(0x56), g_codec.rd(0x58), g_codec.rd(0x49));
+}
+
+// 링버퍼(또는 테스트음)를 I2S 로 계속 밀어낸다. 모드가 BT 면 무음을 밀어
+// DMA 를 굶기지 않는다 — 굶으면 다음 전환에서 딸꾹질이 난다.
+static void jack_task(void *)
+{
+    for (;;) {
+        if (!g_codec_ok) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+
+        const bool tone = (int32_t)(g_tone_until - millis()) > 0;
+        const int32_t q = ((int32_t)g_vol * (int32_t)g_vol) / 100;
+
+        if (tone) {
+            // 스윕. 고정음보다 "정말 나오는 소리" 인지 알아듣기 쉽다.
+            for (int i = 0; i < I2S_BLOCK; i++) {
+                const float t = ((millis() % 2000) / 2000.0f);
+                g_tone_phase += (300.0f + 1500.0f * t) / OUT_HZ;
+                if (g_tone_phase >= 1.0f) g_tone_phase -= 1.0f;
+                const int16_t v = (int16_t)(9000.0f * sinf(2.0f * PI * g_tone_phase));
+                g_i2s_buf[2 * i] = v;
+                g_i2s_buf[2 * i + 1] = v;
+            }
+        } else if (g_out == OUT_JACK) {
+            size_t have = ring_used();
+            have -= have % 4;
+            const size_t want = (size_t)I2S_BLOCK * 4;
+            if (have > want) have = want;
+            size_t rd = g_rd;
+            for (size_t b = 0; b < want; b += 2) {
+                int16_t s = 0;
+                if (b < have) { memcpy(&s, &g_ring[rd & RING_MASK], 2); rd += 2; }
+                ((int16_t *)g_i2s_buf)[b / 2] = (int16_t)(((int32_t)s * q) / 100);
+            }
+            g_rd = rd & RING_MASK;
+            if (g_state == ST_PLAY && have == 0) g_underruns++;
+        } else {
+            memset(g_i2s_buf, 0, (size_t)I2S_BLOCK * 4);
+        }
+
+        size_t wrote = 0;
+        i2s_write(I2S_PORT_JACK, g_i2s_buf, (size_t)I2S_BLOCK * 4, &wrote, portMAX_DELAY);
+        g_i2s_frames += wrote / 4;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────── 저장소 · 곡목록
@@ -358,7 +491,9 @@ static void storage_setup()
 
     // SD 는 1비트 모드로 붙인다(슬롯1 CLK14/CMD15/D0=2). 4비트는 GPIO13 을 먹어
     // KEY2 와 부딪힌다. format_if_empty 는 반드시 false — 카드에 남의 데이터가 있을 수 있다.
-    if (SD_MMC.begin("/sdcard", true /*1bit*/, false /*format_if_empty=false*/)) {
+    // maxOpenFiles 를 3 으로 줄인다 — 기본 5 는 쓰지도 않는 FAT 캐시를 내부 DRAM 에 잡는다.
+    if (SD_MMC.begin("/sdcard", true /*1bit*/, false /*format_if_empty=false*/,
+                     BOARD_MAX_SDMMC_FREQ, 3)) {
         g_have_sd = true;
         g_store_name = "SD";
         Serial.printf("[sd] 마운트됨, %llu MB 중 %llu MB 사용\n",
@@ -468,7 +603,8 @@ static void play_file(const Track &t)
             g_played_frames += (uint32_t)((uint64_t)samples * OUT_HZ / (info.hz ? info.hz : OUT_HZ));
 
             // 링이 절반쯤 찬 뒤에 스트림을 시작한다 — 시작 직후 언더런을 피한다.
-            if (!started && g_bt_conn && ring_used() > RING_SZ / 2) {
+            // 잭 모드에는 이 절차가 없다(jack_task 가 그냥 링을 빨아간다).
+            if (!started && g_out == OUT_BT && g_bt_conn && ring_used() > RING_SZ / 2) {
                 esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
                 vTaskDelay(pdMS_TO_TICKS(50));
                 esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
@@ -549,6 +685,18 @@ static void cmd_step(int d)
 
 static void cmd_vol(int v) { g_vol = constrain(v, 0, 100); g_prefs.putInt("vol", g_vol); }
 
+static void cmd_out(OutMode m)
+{
+    if (m == g_out) return;
+    // A2DP 스트림을 먼저 접는다. 안 접으면 이어폰 쪽이 무음 스트림을 계속 받는다.
+    if (g_out == OUT_BT && g_bt_stream) esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
+    g_out = m;
+    g_prefs.putInt("out", (int)m);
+    Serial.printf("[출력] %s\n", m == OUT_JACK ? "잭 (AC101/I2S)" : "블루투스 (A2DP)");
+    // 재생 중이었다면 같은 곡을 새 경로로 다시 시작한다 — 링을 비우고 가는 게 안전하다.
+    if (g_state == ST_PLAY && g_idx >= 0) cmd_play(g_idx);
+}
+
 // ─────────────────────────────────────────────────────────────── 웹 API
 
 static const char *state_name()
@@ -589,6 +737,10 @@ static void api_status()
     j += "\"src\":\""; j += String(g_src_hz) + "Hz/" + String(g_src_ch) + "ch/" + String(g_bitrate) + "k"; j += "\",";
     j += "\"under\":"; j += String((unsigned)g_underruns); j += ",";
     j += "\"heap\":"; j += String((unsigned)ESP.getFreeHeap()); j += ",";
+    j += "\"out\":\""; j += (g_out == OUT_JACK ? "jack" : "bt"); j += "\",";
+    j += "\"jackok\":"; j += g_codec_ok ? "true," : "false,";
+    j += "\"tone\":"; j += ((int32_t)(g_tone_until - millis()) > 0) ? "true," : "false,";
+    j += "\"i2sframes\":"; j += String((unsigned long)(g_i2s_frames & 0xFFFFFFFF)); j += ",";
     j += "\"storage\":\""; j += g_store_name; j += "\",";
 
     uint64_t used = 0, total = 0;
@@ -801,6 +953,16 @@ static void http_setup()
     g_http.on("/api/prev",   HTTP_POST, [] { cmd_step(-1); g_http.send(200, "text/plain", "ok"); });
     g_http.on("/api/vol",    HTTP_POST, [] { cmd_vol(g_http.arg("v").toInt()); g_http.send(200, "text/plain", "ok"); });
     g_http.on("/api/rescan", HTTP_POST, [] { lib_rescan(); g_http.send(200, "text/plain", "ok"); });
+    g_http.on("/api/out",    HTTP_POST, [] {
+        cmd_out(g_http.arg("m") == "jack" ? OUT_JACK : OUT_BT);
+        g_http.send(200, "text/plain", "ok");
+    });
+    g_http.on("/api/tone",   HTTP_POST, [] {
+        // 잭이 살아 있는지 다시 굽지 않고 확인하는 버튼. 재생 경로와 무관하게 동작한다.
+        const int s = g_http.hasArg("s") ? g_http.arg("s").toInt() : 5;
+        g_tone_until = millis() + (uint32_t)constrain(s, 1, 60) * 1000;
+        g_http.send(200, "text/plain", g_codec_ok ? "ok" : "AC101 이 없다");
+    });
 
     g_http.on("/api/delete", HTTP_POST, [] {
         String n = g_http.arg("f");
@@ -888,6 +1050,12 @@ static void keys_poll()
             k.longsent = true;
             if (k.pin == KEY_BT) { Serial.println("[key] BT 탐색"); bt_scan_start(); }
             else if (k.pin == KEY_PLAY) { cmd_stop(); }
+            else if (k.pin == KEY_VUP) {                  // 테스트음 5초 — 잭이 사는지 귀로 본다
+                g_tone_until = millis() + 5000;
+                Serial.println("[key] 잭 테스트음 5초");
+            } else if (k.pin == KEY_VDN) {                // 출력 경로 전환
+                cmd_out(g_out == OUT_BT ? OUT_JACK : OUT_BT);
+            }
         }
         k.prev = lvl;
     }
@@ -907,12 +1075,14 @@ void setup()
     Serial.begin(115200);
     delay(300);
     Serial.println("\n=== ESP32-Audio-Kit 웹 MP3 플레이어 ===");
-    Serial.println("아날로그 출력은 죽어 있다(I2S 0). 소리는 A2DP 로 나간다.");
+    Serial.println("출력은 두 갈래다: 블루투스(A2DP) 와 3.5mm 잭(AC101/I2S).");
+    Serial.println("잭이 사는지는 아직 아무도 들어본 적이 없다 — 웹 UI 의 테스트음으로 확인하라.");
 
     keys_setup();
     g_fsmux = xSemaphoreCreateMutex();
     g_prefs.begin("mp3", false);
     g_vol = g_prefs.getInt("vol", 60);
+    g_out = (OutMode)g_prefs.getInt("out", (int)OUT_BT);
 
     // 큰 버퍼는 전부 PSRAM 으로. 내부 DRAM 은 BT+WiFi 스택에 남겨야 한다.
     if (!psramFound()) Serial.println("[mem] PSRAM 이 안 보인다 — PSRAM=enabled 로 빌드했는지 확인");
@@ -920,7 +1090,16 @@ void setup()
     g_inbuf = (uint8_t *)ps_malloc(IN_SZ);
     g_pcm   = (int16_t *)ps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t));
     g_dec   = (mp3dec_t *)ps_malloc(sizeof(mp3dec_t));
-    if (!g_ring || !g_inbuf || !g_pcm || !g_dec) {
+
+    // minimp3 의 프레임 스크래치도 PSRAM 으로 뺀다. 원본은 이걸 스택에 잡는데 16KB 가
+    // 넘어서 6KB 스택 태스크가 "Stack canary watchpoint triggered (dec)" 로 즉사했다.
+    // 내부 DRAM 이 27KB 뿐이라 스택을 키우는 건 답이 아니었다.
+    void *scratch = ps_malloc(mp3dec_scratch_size());
+    mp3dec_set_scratch(scratch);
+    Serial.printf("[mem] minimp3 스크래치 %u KB 를 PSRAM 에 잡았다\n",
+                  (unsigned)(mp3dec_scratch_size() / 1024));
+
+    if (!g_ring || !g_inbuf || !g_pcm || !g_dec || !scratch) {
         Serial.println("[mem] 버퍼 할당 실패 — 중단");
         while (1) delay(1000);
     }
@@ -929,13 +1108,22 @@ void setup()
 
     storage_setup();
     lib_rescan();
+    jack_setup();          // I2S/AC101 은 모드와 무관하게 올려 둔다 — 테스트음이 항상 되도록
     wifi_setup();
     http_setup();
     bt_setup();
 
-    // 디코더는 코어 1 에. WiFi/BT 스택은 코어 0 에서 돈다.
-    xTaskCreatePinnedToCore(decode_task, "dec", 6144, nullptr, 5, nullptr, 1);
+    Serial.printf("[출력] %s\n", g_out == OUT_JACK ? "잭 (AC101/I2S)" : "블루투스 (A2DP)");
 
+    // 디코더와 잭 송출은 코어 1 에. WiFi/BT 스택은 코어 0 에서 돈다.
+    xTaskCreatePinnedToCore(decode_task, "dec", 6144, nullptr, 5, nullptr, 1);
+    if (g_codec_ok) xTaskCreatePinnedToCore(jack_task, "jack", 4096, nullptr, 6, nullptr, 1);
+
+    // 초기화가 끝난 뒤의 내부 힙이 진짜 여유다. 여기가 20KB 밑으로 떨어지면
+    // 재생을 걸었을 때 파일 열기에서 죽는다 — 실제로 한 번 그렇게 죽었다.
+    Serial.printf("[mem] 초기화 후 내부 힙 %u KB (최대 연속 블록 %u KB)\n",
+                  (unsigned)(ESP.getFreeHeap() / 1024),
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
     Serial.println("[준비] 브라우저로 접속해 MP3 를 올리고, 이어폰을 페어링 모드로 두고 탐색하면 된다.");
 }
 
