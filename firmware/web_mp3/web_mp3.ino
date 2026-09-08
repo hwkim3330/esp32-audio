@@ -59,7 +59,13 @@ static const int KEY_PREV = 19;   // KEY3
 static const int KEY_VUP  = 23;   // KEY4
 static const int KEY_VDN  = 18;   // KEY5
 static const int KEY_BT   = 5;    // KEY6
-static const int PIN_LED  = 22;   // 상태 LED. 키를 읽기 전에 먼저 설정해야 GPIO13 이 안정된다.
+// GPIO22/21 은 **파워앰프 인에이블 후보**다. 이 저장소는 22 를 "PA_ENABLE(가정)" 으로
+// 적어 두고도(loopback_test/board_pins.h) 동시에 상태 LED 로 깜빡여 왔다. 22 가 정말
+// 앰프 인에이블이면 그 깜빡임이 **청음 시험 내내 앰프를 켜고 끄는 짓**이다.
+// 리비전에 따라 21 을 쓰기도 하므로 **둘 다 계속 HIGH 로 잡아 둔다.** 깜빡이지 않는다.
+// (키를 읽기 전에 이 핀들을 먼저 설정해야 GPIO13 이 GPIO22 에 끌리지 않는다.)
+static const int PIN_PA_A = 22;
+static const int PIN_PA_B = 21;
 
 static const int SD_CLK = 14, SD_CMD = 15, SD_D0 = 2;   // SDMMC 슬롯1, 1비트 모드
 
@@ -993,6 +999,25 @@ static void http_setup()
         g_http.send(esp_a2d_source_connect(a) == ESP_OK ? 200 : 500, "text/plain", "ok");
     });
 
+    // AC101 레지스터 덤프. 다시 굽지 않고 코덱 상태를 보려면 이게 필요하다 —
+    // 무언가를 물리적으로 바꿔 보며 앞뒤를 비교할 때 쓴다.
+    g_http.on("/api/codec", HTTP_GET, [] {
+        if (!g_codec_ok) { g_http.send(503, "text/plain", "AC101 없음"); return; }
+        static const uint8_t regs[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0C, 0x10, 0x11,
+                                       0x40, 0x41, 0x44, 0x45, 0x46, 0x48, 0x49, 0x4C, 0x4D,
+                                       0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x58};
+        String j = "{\"pa22\":" + String(digitalRead(PIN_PA_A)) +
+                   ",\"pa21\":" + String(digitalRead(PIN_PA_B)) + ",\"regs\":{";
+        for (unsigned i = 0; i < sizeof regs; i++) {
+            if (i) j += ",";
+            char b[24];
+            snprintf(b, sizeof b, "\"0x%02X\":\"0x%04X\"", regs[i], g_codec.rd(regs[i]));
+            j += b;
+        }
+        j += "}}";
+        g_http.send(200, "application/json", j);
+    });
+
     g_http.on("/api/sd/list", HTTP_GET, api_sd_list);
     g_http.onNotFound([] {
         if (g_http.uri().startsWith("/sd/")) api_sd_get();
@@ -1023,9 +1048,12 @@ static Key g_keys[] = {
 
 static void keys_setup()
 {
-    // LED 핀을 먼저 잡는다. 이걸 안 하면 GPIO13(KEY2)이 GPIO22 상태에 끌려 LOW 로 읽힌다.
-    pinMode(PIN_LED, OUTPUT);
-    digitalWrite(PIN_LED, LOW);
+    // 앰프 인에이블 후보 두 개를 먼저 HIGH 로 못박는다. GPIO13(KEY2)이 GPIO22 에 끌리는
+    // 문제도 이걸로 같이 해결된다(핀을 먼저 구동해 두면 읽기가 안정된다).
+    pinMode(PIN_PA_A, OUTPUT);
+    pinMode(PIN_PA_B, OUTPUT);
+    digitalWrite(PIN_PA_A, HIGH);
+    digitalWrite(PIN_PA_B, HIGH);
     for (auto &k : g_keys) pinMode(k.pin, k.pin == 36 ? INPUT : INPUT_PULLUP);   // 36 은 입력 전용(내부 풀업 없음)
 }
 
@@ -1061,12 +1089,9 @@ static void keys_poll()
     }
 }
 
-static void led_poll()
-{
-    // 켜짐 = 스트리밍, 느린 깜빡임 = BT 연결만, 빠른 깜빡임 = BT 미연결
-    const uint32_t p = g_bt_stream ? 0 : (g_bt_conn ? 1000 : 250);
-    digitalWrite(PIN_LED, p == 0 ? HIGH : ((millis() / p) & 1));
-}
+// 상태 표시를 위해 GPIO22 를 깜빡이는 짓은 하지 않는다 — 그 핀이 앰프 인에이블일
+// 수 있고, 그러면 소리를 끊어 놓고 "안 들린다" 는 판정을 내리게 된다.
+// 상태는 웹 UI 와 시리얼로 본다.
 
 // ─────────────────────────────────────────────────────────────── setup / loop
 
@@ -1131,6 +1156,5 @@ void loop()
 {
     g_http.handleClient();
     keys_poll();
-    led_poll();
     delay(2);
 }

@@ -35,7 +35,10 @@ static const int PIN_SDA = 33, PIN_SCL = 32;
 
 // 실기로 확정된 키 매핑. 한때 두 칸 밀려 있어서 "3번만 반응한다" 로 보였다.
 static const int KEY1 = 36, KEY2 = 13, KEY3 = 19, KEY4 = 23, KEY5 = 18, KEY6 = 5;
-static const int PIN_LED = 22;
+// 앰프 인에이블 후보. 이 저장소는 22 를 PA_ENABLE(가정)로 적어 두고도 LED 로
+// 깜빡여 왔다 — 22 가 정말 앰프 인에이블이면 청음 시험 내내 앰프를 끊는 짓이다.
+// 리비전에 따라 21 을 쓰기도 하므로 둘 다 HIGH 로 못박고 깜빡이지 않는다.
+static const int PIN_PA_A = 22, PIN_PA_B = 21;
 
 // AC101 레지스터 상수 (라이브러리가 .cpp 안에 숨겨 놔서 여기 다시 적는다)
 static const uint8_t R_DAC_DIG_CTRL = 0x48, R_DAC_VOL_CTRL = 0x49;
@@ -220,9 +223,10 @@ void setup()
     Serial.println("\n=== 잭 청음 시험 — 출력이 죽었는지 귀로 가른다 ===");
     Serial.println("확정된 사실: 입력(ADC)은 정확히 0 을 보낸다. 출력은 아무도 들어본 적 없다.");
 
-    // LED 핀을 키보다 먼저 잡는다 — 안 하면 GPIO13(KEY2)이 GPIO22 에 끌려 LOW 로 읽힌다.
-    pinMode(PIN_LED, OUTPUT);
-    digitalWrite(PIN_LED, HIGH);
+    // 앰프 인에이블 후보를 키보다 먼저 HIGH 로 잡는다 — GPIO13(KEY2)이 GPIO22 에
+    // 끌리는 문제도 같이 해결된다.
+    pinMode(PIN_PA_A, OUTPUT); digitalWrite(PIN_PA_A, HIGH);
+    pinMode(PIN_PA_B, OUTPUT); digitalWrite(PIN_PA_B, HIGH);
     for (auto &b : btn) pinMode(b.pin, b.pin == 36 ? INPUT : INPUT_PULLUP);
 
     if (!codec.begin(PIN_SDA, PIN_SCL)) {
@@ -244,7 +248,6 @@ void loop()
     static uint32_t last = 0;
     if (millis() - last > 60) {                 // 버튼은 60ms 마다만 본다(오디오가 우선)
         last = millis();
-        digitalWrite(PIN_LED, (millis() / 500) & 1);
         for (auto &b : btn) {
             const bool lvl = digitalRead(b.pin);
             if (b.prev && !lvl) {               // 눌림
