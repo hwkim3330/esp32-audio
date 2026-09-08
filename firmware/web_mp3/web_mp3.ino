@@ -119,6 +119,11 @@ static volatile Role    g_role = ROLE_PLAYER;   // 플레이어냐 BT 스피커�
 static volatile int     g_sink_hz = 44100;      // 싱크가 협상한 샘플레이트
 static volatile int     g_sink_ch = 2;
 static volatile uint32_t g_sink_bytes = 0;      // 싱크로 실제로 들어온 바이트
+static volatile bool     g_prebuf = false;      // 선버퍼링이 찼는가
+static volatile uint32_t g_starves = 0;         // 링이 굶어 무음을 낸 횟수
+static volatile bool     g_wifi_off_audio = true;  // 스트리밍 중 WiFi 를 끈다
+static volatile int      g_wifi_req = 0;        // 1=끄기 2=켜기 (loop 에서 처리)
+static volatile uint32_t g_wifi_on_at = 0;      // 이 시각에 다시 켠다
 static volatile bool   g_busy_fs = false;       // 업로드/다운로드 중 — 재생을 양보한다
 
 static std::vector<Track> g_lib;
@@ -305,6 +310,14 @@ static void a2dp_cb(esp_a2d_cb_event_t ev, esp_a2d_cb_param_t *p)
     case ESP_A2D_AUDIO_STATE_EVT:
         g_bt_stream = (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
         Serial.printf("[a2dp] 스트리밍 %s\n", g_bt_stream ? "시작" : "정지");
+        // WiFi 와 클래식 BT 는 같은 2.4GHz 프런트엔드를 나눠 쓴다. 싱크로 음악을
+        // 받는 동안 AP 를 띄워 두면 그게 그대로 끊김(지지직)이 된다. 스트리밍 중에는
+        // 끄고, 멈춘 뒤 3초 있다가 되살린다(웹 UI 를 다시 쓸 수 있게).
+        // WiFi API 를 BT 콜백에서 직접 부르면 위험하므로 요청만 남기고 loop 에서 한다.
+        if (g_role == ROLE_SINK && g_wifi_off_audio) {
+            if (g_bt_stream) { g_wifi_req = 1; }
+            else { g_wifi_on_at = millis() + 3000; }
+        }
         break;
     default:
         break;
@@ -406,7 +419,7 @@ static void bt_setup()
         // 띄워도 "스피커" 로 인식하지 않아 오디오 출력 장치로 안 잡힌다.
         esp_bt_cod_t cod = {};
         cod.major = ESP_BT_COD_MAJOR_DEV_AV;
-        cod.minor = 0x05;                      // Loudspeaker
+        cod.minor = 0x06;                      // Headphones (맥에서 헤드폰 아이콘으로 보인다)
         cod.service = ESP_BT_COD_SRVC_AUDIO | ESP_BT_COD_SRVC_RENDERING;
         esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
 
@@ -483,7 +496,9 @@ static void jack_setup()
     cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count = 4;      // 4×256프레임 ≈ 23ms. 내부 DRAM 이 빡빡해서 6 에서 줄였다
+    // 싱크 모드는 SD/LittleFS 를 안 올려 내부 DRAM 여유가 있으니 DMA 를 넉넉히 준다.
+    // 23ms(4개)면 웹서버·BT 태스크에 밀릴 때 DMA 가 굶어 딱딱거린다.
+    cfg.dma_buf_count = (g_role == ROLE_SINK) ? 8 : 4;   // 8×256프레임 ≈ 46ms
     cfg.dma_buf_len = I2S_BLOCK;
     cfg.use_apll = false;
     cfg.tx_desc_auto_clear = true;
@@ -504,6 +519,11 @@ static void jack_setup()
     g_i2s_buf = (int16_t *)heap_caps_malloc((size_t)I2S_BLOCK * 2 * sizeof(int16_t), MALLOC_CAP_DMA);
     if (!g_i2s_buf) { Serial.println("[잭] DMA 버퍼 실패"); g_codec_ok = false; return; }
 
+    {   // 저장된 음량을 코덱 볼륨으로 반영한다
+        const uint8_t hv = (uint8_t)((g_vol * 63) / 100);
+        g_codec.SetVolumeHeadphone(hv);
+        g_codec.SetVolumeSpeaker(hv);
+    }
     Serial.printf("[잭] 준비됨 — HPOUT=0x%04X SPKOUT=0x%04X DAC_VOL=0x%04X\n",
                   g_codec.rd(0x56), g_codec.rd(0x58), g_codec.rd(0x49));
 }
@@ -516,7 +536,9 @@ static void jack_task(void *)
         if (!g_codec_ok) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
 
         const bool tone = (int32_t)(g_tone_until - millis()) > 0;
-        const int32_t q = ((int32_t)g_vol * (int32_t)g_vol) / 100;
+        // ★ 잭 경로에서는 디지털로 음량을 깎지 않는다. 0.36배 곱하면 정수 절단으로
+        //   해상도가 1.4비트 날아가고 그게 노이즈로 들린다. 음량은 AC101 의 아날로그
+        //   볼륨(SetVolumeHeadphone)으로 내린다 — cmd_vol() 이 같이 반영한다.
 
         if (tone) {
             // 스윕. 고정음보다 "정말 나오는 소리" 인지 알아듣기 쉽다.
@@ -529,18 +551,41 @@ static void jack_task(void *)
                 g_i2s_buf[2 * i + 1] = v;
             }
         } else if (g_out == OUT_JACK) {
+            const size_t want = (size_t)I2S_BLOCK * 4;
+
+            // 선버퍼링. 링이 어느 정도 찰 때까지 무음을 내고 기다린다.
+            //
+            // 이걸 안 하면 데이터가 조금 모자랄 때마다 그 자리에 무음을 끼워 넣게 되고,
+            // 그게 정확히 "지지직" 으로 들린다. 특히 A2DP 싱크는 상대(맥) 클럭으로
+            // 들어오고 I2S 는 우리 클럭으로 나가므로 둘이 서로 밀린다 — 흡수할 여유가
+            // 있어야 한다. RING_SZ/8 = 약 185ms.
+            if (!g_prebuf) {
+                if (ring_used() < RING_SZ / 8) {
+                    memset(g_i2s_buf, 0, want);
+                    size_t w0 = 0;
+                    i2s_write(I2S_PORT_JACK, g_i2s_buf, want, &w0, portMAX_DELAY);
+                    g_i2s_frames += w0 / 4;
+                    continue;
+                }
+                g_prebuf = true;
+            }
             size_t have = ring_used();
             have -= have % 4;
-            const size_t want = (size_t)I2S_BLOCK * 4;
-            if (have > want) have = want;
+            if (have < want) {                  // 굶었다 — 무음을 내고 다시 채운다
+                g_starves++;
+                if (have == 0) g_prebuf = false;
+                memset(g_i2s_buf, 0, want);
+                size_t w0 = 0;
+                i2s_write(I2S_PORT_JACK, g_i2s_buf, want, &w0, portMAX_DELAY);
+                g_i2s_frames += w0 / 4;
+                continue;
+            }
             size_t rd = g_rd;
-            for (size_t b = 0; b < want; b += 2) {
-                int16_t s = 0;
-                if (b < have) { memcpy(&s, &g_ring[rd & RING_MASK], 2); rd += 2; }
-                ((int16_t *)g_i2s_buf)[b / 2] = (int16_t)(((int32_t)s * q) / 100);
+            for (size_t b = 0; b < want; b += 2) {           // 풀스케일로 그대로 넘긴다
+                memcpy((uint8_t *)g_i2s_buf + b, &g_ring[rd & RING_MASK], 2);
+                rd += 2;
             }
             g_rd = rd & RING_MASK;
-            if (g_state == ST_PLAY && have == 0) g_underruns++;
         } else {
             memset(g_i2s_buf, 0, (size_t)I2S_BLOCK * 4);
         }
@@ -800,7 +845,17 @@ static void cmd_step(int d)
     cmd_play(i);
 }
 
-static void cmd_vol(int v) { g_vol = constrain(v, 0, 100); g_prefs.putInt("vol", g_vol); }
+static void cmd_vol(int v)
+{
+    g_vol = constrain(v, 0, 100);
+    g_prefs.putInt("vol", g_vol);
+    // 잭은 코덱의 아날로그 볼륨으로 내린다(0~63). 디지털로 깎으면 노이즈가 된다.
+    if (g_codec_ok) {
+        const uint8_t hv = (uint8_t)((g_vol * 63) / 100);
+        g_codec.SetVolumeHeadphone(hv);
+        g_codec.SetVolumeSpeaker(hv);
+    }
+}
 
 static void cmd_out(OutMode m)
 {
@@ -857,6 +912,7 @@ static void api_status()
     j += "\"role\":\""; j += (g_role == ROLE_SINK ? "sink" : "player"); j += "\",";
     j += "\"sinkhz\":"; j += String((int)g_sink_hz); j += ",";
     j += "\"sinkkb\":"; j += String((unsigned)(g_sink_bytes / 1024)); j += ",";
+    j += "\"starve\":"; j += String((unsigned)g_starves); j += ",";
     j += "\"sinkdrop\":"; j += String((unsigned)g_sink_drops); j += ",";
     j += "\"out\":\""; j += (g_out == OUT_JACK ? "jack" : "bt"); j += "\",";
     j += "\"hp\":"; j += (digitalRead(PIN_HP_DETECT) == LOW) ? "true," : "false,";
@@ -1088,6 +1144,11 @@ static void http_setup()
         cmd_out(g_http.arg("m") == "jack" ? OUT_JACK : OUT_BT);
         g_http.send(200, "text/plain", "ok");
     });
+    g_http.on("/api/pa", HTTP_POST, [] {
+        const bool on = (g_http.arg("on") == "1");
+        digitalWrite(PIN_PA, on ? HIGH : LOW);
+        g_http.send(200, "text/plain", on ? "앰프 ON(스피커용)" : "앰프 OFF");
+    });
     g_http.on("/api/tone",   HTTP_POST, [] {
         // 잭이 살아 있는지 다시 굽지 않고 확인하는 버튼. 재생 경로와 무관하게 동작한다.
         const int s = g_http.hasArg("s") ? g_http.arg("s").toInt() : 5;
@@ -1177,7 +1238,10 @@ static void keys_setup()
     // 이걸로 같이 해결된다(핀을 먼저 구동해 두면 읽기가 안정된다).
     pinMode(PIN_PA, OUTPUT);
     pinMode(PIN_LED_G, OUTPUT);
-    digitalWrite(PIN_PA, HIGH);      // 파워앰프 켠다
+    // ★ 파워앰프는 기본 OFF. 스피커 JST 에 아무것도 안 붙은 상태에서 앰프를 돌리면
+    //   아날로그 전원에 노이즈를 얹어 헤드폰 잭 쪽 잡음이 커진다. 스피커를 쓸 때만
+    //   /api/pa?on=1 로 켠다.
+    digitalWrite(PIN_PA, LOW);
     digitalWrite(PIN_LED_G, HIGH);   // 전원 표시로 그냥 켜 둔다(깜빡이지 않는다)
     for (auto &k : g_keys) pinMode(k.pin, k.pin == 36 ? INPUT : INPUT_PULLUP);   // 36 은 입력 전용(내부 풀업 없음)
 }
@@ -1290,6 +1354,30 @@ void setup()
 
 void loop()
 {
+    // WiFi 켜기/끄기는 여기서 처리한다(BT 콜백에서 직접 만지면 위험하다).
+    if (g_wifi_req == 1) {
+        g_wifi_req = 0;
+        Serial.println("[wifi] 스트리밍 중 — WiFi 를 끈다(2.4GHz 를 BT 에 양보)");
+        WiFi.mode(WIFI_OFF);
+    } else if (g_wifi_on_at && (int32_t)(millis() - g_wifi_on_at) > 0 && !g_bt_stream) {
+        g_wifi_on_at = 0;
+        Serial.println("[wifi] 스트리밍 멈춤 — WiFi 를 되살린다");
+        wifi_setup();
+        g_http.begin();
+    }
+
+    // 싱크 상태를 시리얼로 주기적으로 찍는다 — WiFi 가 꺼져 있어도 이걸로 계측한다.
+    if (g_role == ROLE_SINK) {
+        static uint32_t last_stat = 0;
+        if (g_bt_stream && millis() - last_stat > 3000) {
+            last_stat = millis();
+            Serial.printf("[싱크] 수신 %u KB · 버림 %u · 굶음 %u · 링 %u%% · 힙 %u\n",
+                          (unsigned)(g_sink_bytes / 1024), (unsigned)g_sink_drops,
+                          (unsigned)g_starves, (unsigned)(ring_used() * 100 / RING_SZ),
+                          (unsigned)ESP.getFreeHeap());
+        }
+    }
+
     g_http.handleClient();
     keys_poll();
     delay(2);
