@@ -659,21 +659,66 @@ static void api_sd_list()
     g_http.send(200, "application/json; charset=utf-8", j);
 }
 
+// SD 파일을 내려준다. Range 를 직접 처리한다 — WebServer::streamFile 은 Range 를
+// 무시하고 항상 전체를 보낸다. 1.4GB 를 50분 받다가 한 번 끊기면 처음부터 다시
+// 받아야 하는데, 그게 이 경로에서 제일 큰 위험이었다.
 static void api_sd_get()
 {
     if (!g_have_sd) { g_http.send(404, "text/plain", "SD 없음"); return; }
-    String uri = g_http.uri();                 // /sd/<경로>
-    String p = uri.substring(3);               // "/sd" 를 떼면 앞에 / 가 남는다
+    String p = g_http.urlDecode(g_http.uri().substring(3));   // "/sd" 를 떼면 앞에 / 가 남는다
     if (p.length() == 0) p = "/";
 
     File f = SD_MMC.open(p.c_str(), FILE_READ);
     if (!f || f.isDirectory()) { g_http.send(404, "text/plain", "파일 없음"); return; }
 
+    const size_t len = f.size();
+    size_t start = 0, end = len ? len - 1 : 0;
+    bool partial = false;
+
+    String r = g_http.header("Range");
+    if (r.startsWith("bytes=")) {
+        r = r.substring(6);
+        const int dash = r.indexOf('-');
+        if (dash >= 0) {
+            if (dash > 0) start = (size_t)strtoull(r.substring(0, dash).c_str(), nullptr, 10);
+            const String tail = r.substring(dash + 1);
+            if (tail.length()) end = (size_t)strtoull(tail.c_str(), nullptr, 10);
+            if (end >= len) end = len ? len - 1 : 0;
+            if (start <= end) partial = true;
+        }
+    }
+    if (!partial) { start = 0; end = len ? len - 1 : 0; }
+    const size_t want = (len == 0) ? 0 : (end - start + 1);
+
     // 큰 파일을 내려주는 동안 디코더가 SD 를 같이 읽으면 둘 다 느려진다. 재생을 양보한다.
     const bool was = (g_state == ST_PLAY);
     g_busy_fs = true;
-    g_http.sendHeader("Content-Disposition", "attachment");
-    g_http.streamFile(f, "application/octet-stream");
+
+    WiFiClient c = g_http.client();
+    String h = partial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n";
+    h += "Content-Type: application/octet-stream\r\n";
+    h += "Content-Length: " + String((unsigned long)want) + "\r\n";
+    h += "Accept-Ranges: bytes\r\n";
+    if (partial)
+        h += "Content-Range: bytes " + String((unsigned long)start) + "-" +
+             String((unsigned long)end) + "/" + String((unsigned long)len) + "\r\n";
+    h += "Content-Disposition: attachment\r\n";
+    h += "Connection: close\r\n\r\n";
+    c.print(h);
+
+    if (want) {
+        f.seek(start);
+        // 4KB 씩 민다. 더 작게 쓰면 TCP 헤더 몫이 커지고, 더 크게 잡으면 내부 DRAM 이 아깝다.
+        static uint8_t buf[4096];
+        size_t left = want;
+        while (left && c.connected()) {
+            const size_t n = f.read(buf, left < sizeof buf ? left : sizeof buf);
+            if (n == 0) break;
+            if (c.write(buf, n) != n) break;
+            left -= n;
+        }
+    }
+    c.stop();
     f.close();
     g_busy_fs = false;
     if (was) g_state = ST_PLAY;
@@ -799,6 +844,10 @@ static void http_setup()
         delay(300);
         ESP.restart();
     });
+
+    // Range 헤더는 기본으로 수집되지 않는다. 명시해야 header("Range") 가 값을 준다.
+    const char *want_headers[] = {"Range"};
+    g_http.collectHeaders(want_headers, 1);
 
     g_http.begin();
 }
