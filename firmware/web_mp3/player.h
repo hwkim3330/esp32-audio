@@ -14,6 +14,12 @@ enum PState { ST_IDLE, ST_PLAY, ST_PAUSE };
 // 링버퍼 소비자가 둘이 되면 드리프트를 흡수할 곳이 없다.
 enum OutMode { OUT_BT, OUT_JACK };
 
+// 보드의 역할. Bluedroid 는 A2DP 소스와 싱크를 동시에 못 든다 —
+// 바꿀 때는 NVS 에 적고 재부팅한다(역할 전환 중 상태가 꼬이는 걸 피한다).
+//   ROLE_PLAYER : 파일(SD/플래시) → 디코드 → 잭 또는 BT 이어폰
+//   ROLE_SINK   : 맥·폰이 이 보드에 연결 → 그 소리가 잭으로 나온다 (BT 스피커)
+enum Role { ROLE_PLAYER, ROLE_SINK };
+
 struct Track {
     String name;
     String path;

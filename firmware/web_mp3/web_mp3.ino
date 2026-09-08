@@ -115,6 +115,10 @@ static volatile bool   g_req_stop = false;      // 디코더에게 현재 곡을
 static volatile int    g_req_track = -1;        // >=0 이면 그 인덱스로 전환
 static volatile int    g_vol = 60;              // 0~100, 출력단에서 적용(즉시 반응)
 static volatile OutMode g_out = OUT_BT;         // 소리를 어디로 낼지
+static volatile Role    g_role = ROLE_PLAYER;   // 플레이어냐 BT 스피커냐
+static volatile int     g_sink_hz = 44100;      // 싱크가 협상한 샘플레이트
+static volatile int     g_sink_ch = 2;
+static volatile uint32_t g_sink_bytes = 0;      // 싱크로 실제로 들어온 바이트
 static volatile bool   g_busy_fs = false;       // 업로드/다운로드 중 — 재생을 양보한다
 
 static std::vector<Track> g_lib;
@@ -208,8 +212,83 @@ static int32_t a2dp_data_cb(uint8_t *buf, int32_t len)
     return len;
 }
 
+// ── A2DP 싱크: 맥·폰이 보낸 소리가 여기로 들어온다 (컨트롤러가 SBC 를 이미 풀어 준다).
+//
+// BT 태스크에서 불리므로 절대 막히면 안 된다 — 링이 꽉 차면 **버린다**.
+// 디코더 경로(ring_put_frame)는 기다리지만 여기서 기다리면 BT 스택이 밀린다.
+static float   g_sk_pos = 0.0f;
+static int16_t g_sk_prev_l = 0, g_sk_prev_r = 0;
+static volatile uint32_t g_sink_drops = 0;
+
+static inline bool sink_put(int16_t l, int16_t r)
+{
+    if (ring_free() < 4) { g_sink_drops++; return false; }
+    size_t w = g_wr;
+    memcpy(&g_ring[w & RING_MASK], &l, 2); w += 2;
+    memcpy(&g_ring[w & RING_MASK], &r, 2); w += 2;
+    g_wr = w & RING_MASK;
+    return true;
+}
+
+static void a2dp_sink_data_cb(const uint8_t *data, uint32_t len)
+{
+    if (!data || !g_ring) return;
+    g_sink_bytes += len;
+
+    const int ch = g_sink_ch >= 2 ? 2 : 1;
+    const int n = (int)(len / (2 * ch));               // 프레임 수
+    const int16_t *in = (const int16_t *)data;
+    if (n <= 0) return;
+
+    if (g_sink_hz == OUT_HZ) {                          // 보통 맥·폰은 44.1kHz 다
+        for (int i = 0; i < n; i++) {
+            const int16_t l = in[ch == 2 ? 2 * i : i];
+            const int16_t r = (ch == 2) ? in[2 * i + 1] : l;
+            if (!sink_put(l, r)) return;                // 꽉 찼으면 이 블록은 포기
+        }
+        g_sk_prev_l = in[ch == 2 ? 2 * (n - 1) : n - 1];
+        g_sk_prev_r = (ch == 2) ? in[2 * (n - 1) + 1] : g_sk_prev_l;
+        return;
+    }
+
+    // 협상 결과가 44.1kHz 가 아니면 리샘플한다. AC101 은 44100 을 벗어나면
+    // PLL 이 락을 잃으므로 I2S 쪽 레이트를 바꾸는 건 답이 아니다.
+    const float step = (float)g_sink_hz / (float)OUT_HZ;
+    float pos = g_sk_pos;
+    while (pos < (float)n) {
+        const int i = (int)pos;
+        const float f = pos - (float)i;
+        int16_t al, ar, bl, br;
+        if (i == 0) { al = g_sk_prev_l; ar = g_sk_prev_r; }
+        else if (ch == 2) { al = in[2 * (i - 1)]; ar = in[2 * (i - 1) + 1]; }
+        else { al = ar = in[i - 1]; }
+        if (ch == 2) { bl = in[2 * i]; br = in[2 * i + 1]; }
+        else { bl = br = in[i]; }
+        if (!sink_put((int16_t)(al + (bl - al) * f), (int16_t)(ar + (br - ar) * f))) break;
+        pos += step;
+    }
+    g_sk_pos = pos - (float)n;
+    if (g_sk_pos < 0) g_sk_pos = 0;
+    g_sk_prev_l = in[ch == 2 ? 2 * (n - 1) : n - 1];
+    g_sk_prev_r = (ch == 2) ? in[2 * (n - 1) + 1] : g_sk_prev_l;
+}
+
 static void a2dp_cb(esp_a2d_cb_event_t ev, esp_a2d_cb_param_t *p)
 {
+    // 싱크가 협상한 코덱 설정. SBC 헤더에서 샘플레이트·채널을 꺼낸다.
+    if (ev == ESP_A2D_AUDIO_CFG_EVT) {
+        if (p->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
+            const uint8_t *c = p->audio_cfg.mcc.cie.sbc;
+            const uint8_t fs = c[0] & 0xF0;
+            g_sink_hz = (fs & 0x80) ? 16000 : (fs & 0x40) ? 32000 : (fs & 0x20) ? 44100 : 48000;
+            g_sink_ch = ((c[0] & 0x08) != 0) ? 1 : 2;   // 0x08 = MONO
+            Serial.printf("[싱크] 코덱 협상 %dHz %dch\n", g_sink_hz, g_sink_ch);
+            g_sk_pos = 0; g_sk_prev_l = g_sk_prev_r = 0;
+            ring_reset();
+        }
+        return;
+    }
+
     switch (ev) {
     case ESP_A2D_CONNECTION_STATE_EVT:
         if (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
@@ -317,15 +396,35 @@ static void bt_setup()
     esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &iocap, sizeof(iocap));
 
     esp_a2d_register_callback(a2dp_cb);
-    esp_a2d_source_register_data_callback(a2dp_data_cb);
-    if (esp_a2d_source_init() != ESP_OK) { Serial.println("[a2dp] 소스 init 실패"); return; }
+
+    if (g_role == ROLE_SINK) {
+        // BT 스피커 역할. 맥·폰이 스캔해서 붙으면 그 소리가 잭으로 나온다.
+        esp_a2d_sink_register_data_callback(a2dp_sink_data_cb);
+        if (esp_a2d_sink_init() != ESP_OK) { Serial.println("[a2dp] 싱크 init 실패"); return; }
+
+        // 기기 종류(CoD)를 오디오 렌더링으로 알린다. 이걸 안 하면 맥이 목록에
+        // 띄워도 "스피커" 로 인식하지 않아 오디오 출력 장치로 안 잡힌다.
+        esp_bt_cod_t cod = {};
+        cod.major = ESP_BT_COD_MAJOR_DEV_AV;
+        cod.minor = 0x05;                      // Loudspeaker
+        cod.service = ESP_BT_COD_SRVC_AUDIO | ESP_BT_COD_SRVC_RENDERING;
+        esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
+
+        g_out = OUT_JACK;                      // 싱크의 소리는 잭으로 낸다
+        Serial.println("[a2dp] **싱크(BT 스피커)** 모드 — 맥·폰에서 스캔해 연결하라");
+    } else {
+        esp_a2d_source_register_data_callback(a2dp_data_cb);
+        if (esp_a2d_source_init() != ESP_OK) { Serial.println("[a2dp] 소스 init 실패"); return; }
+        Serial.println("[a2dp] 소스 모드 — 보드가 이어폰으로 보낸다");
+    }
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
     const uint8_t *mac = esp_bt_dev_get_address();
     Serial.printf("[bt] 준비됨, MAC %02x:%02x:%02x:%02x:%02x:%02x, 이름 %s\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], BT_NAME);
 
-    // 지난번 붙었던 기기로 자동 재연결
+    // 지난번 붙었던 기기로 자동 재연결 (소스 역할일 때만. 싱크는 상대가 붙어 온다)
+    if (g_role == ROLE_SINK) return;
     String last = g_prefs.getString("bt", "");
     if (last.length() && addr_parse(last, g_bt_target)) {
         g_bt_have_target = true;
@@ -670,6 +769,8 @@ static void decode_task(void *)
 
 static void cmd_play(int i)
 {
+    // 싱크 모드에서는 링버퍼를 맥·폰이 쓴다. 디코더가 같이 쓰면 서로 뭉갠다.
+    if (g_role == ROLE_SINK) return;
     if (i < 0 || i >= (int)g_lib.size()) return;
     g_req_stop = true;
     g_state = ST_PLAY;
@@ -753,6 +854,10 @@ static void api_status()
     j += "\"src\":\""; j += String(g_src_hz) + "Hz/" + String(g_src_ch) + "ch/" + String(g_bitrate) + "k"; j += "\",";
     j += "\"under\":"; j += String((unsigned)g_underruns); j += ",";
     j += "\"heap\":"; j += String((unsigned)ESP.getFreeHeap()); j += ",";
+    j += "\"role\":\""; j += (g_role == ROLE_SINK ? "sink" : "player"); j += "\",";
+    j += "\"sinkhz\":"; j += String((int)g_sink_hz); j += ",";
+    j += "\"sinkkb\":"; j += String((unsigned)(g_sink_bytes / 1024)); j += ",";
+    j += "\"sinkdrop\":"; j += String((unsigned)g_sink_drops); j += ",";
     j += "\"out\":\""; j += (g_out == OUT_JACK ? "jack" : "bt"); j += "\",";
     j += "\"hp\":"; j += (digitalRead(PIN_HP_DETECT) == LOW) ? "true," : "false,";
     j += "\"jackok\":"; j += g_codec_ok ? "true," : "false,";
@@ -970,6 +1075,15 @@ static void http_setup()
     g_http.on("/api/prev",   HTTP_POST, [] { cmd_step(-1); g_http.send(200, "text/plain", "ok"); });
     g_http.on("/api/vol",    HTTP_POST, [] { cmd_vol(g_http.arg("v").toInt()); g_http.send(200, "text/plain", "ok"); });
     g_http.on("/api/rescan", HTTP_POST, [] { lib_rescan(); g_http.send(200, "text/plain", "ok"); });
+    // 역할 전환. Bluedroid 는 소스와 싱크를 동시에 못 들고, 런타임 전환도 상태가
+    // 꼬이기 쉽다 — NVS 에 적고 재부팅하는 쪽이 확실하다.
+    g_http.on("/api/role", HTTP_POST, [] {
+        const bool sink = (g_http.arg("r") == "sink");
+        g_prefs.putInt("role", sink ? (int)ROLE_SINK : (int)ROLE_PLAYER);
+        g_http.send(200, "text/plain", sink ? "싱크로 전환, 재부팅" : "플레이어로 전환, 재부팅");
+        delay(300);
+        ESP.restart();
+    });
     g_http.on("/api/out",    HTTP_POST, [] {
         cmd_out(g_http.arg("m") == "jack" ? OUT_JACK : OUT_BT);
         g_http.send(200, "text/plain", "ok");
@@ -1113,13 +1227,15 @@ void setup()
     delay(300);
     Serial.println("\n=== ESP32-Audio-Kit 웹 MP3 플레이어 ===");
     Serial.println("출력은 두 갈래다: 블루투스(A2DP) 와 3.5mm 잭(AC101/I2S).");
-    Serial.println("잭이 사는지는 아직 아무도 들어본 적이 없다 — 웹 UI 의 테스트음으로 확인하라.");
+    Serial.println("잭 출력은 실기 확인됐다(2026-09-08). 8월의 '오디오 죽음' 은");
+    Serial.println("board_pins.h 의 LRCK/DOUT 이 25/26 으로 뒤바뀐 탓이었다.");
 
     keys_setup();
     g_fsmux = xSemaphoreCreateMutex();
     g_prefs.begin("mp3", false);
     g_vol = g_prefs.getInt("vol", 60);
     g_out = (OutMode)g_prefs.getInt("out", (int)OUT_BT);
+    g_role = (Role)g_prefs.getInt("role", (int)ROLE_PLAYER);
 
     // 큰 버퍼는 전부 PSRAM 으로. 내부 DRAM 은 BT+WiFi 스택에 남겨야 한다.
     if (!psramFound()) Serial.println("[mem] PSRAM 이 안 보인다 — PSRAM=enabled 로 빌드했는지 확인");
@@ -1143,8 +1259,16 @@ void setup()
     Serial.printf("[mem] PSRAM 여유 %u KB, 내부 힙 %u KB\n",
                   (unsigned)(ESP.getFreePsram() / 1024), (unsigned)(ESP.getFreeHeap() / 1024));
 
-    storage_setup();
-    lib_rescan();
+    // 싱크(BT 스피커) 모드에서는 파일을 안 쓴다. SD/LittleFS 마운트는 내부 DRAM 을
+    // 상당히 먹는데 BT 싱크 + WiFi + 웹서버가 이미 빡빡하다(싱크에서 힙 10KB 까지
+    // 떨어지는 걸 봤다). 안 올려서 돌려준다.
+    if (g_role == ROLE_PLAYER) {
+        storage_setup();
+        lib_rescan();
+    } else {
+        g_store_name = "쓰지 않음(싱크)";
+        Serial.println("[fs] 싱크 모드 — SD/플래시를 마운트하지 않는다(메모리 확보)");
+    }
     jack_setup();          // I2S/AC101 은 모드와 무관하게 올려 둔다 — 테스트음이 항상 되도록
     wifi_setup();
     http_setup();

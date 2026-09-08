@@ -47,7 +47,7 @@ progress{width:100%;height:5px}
 </style></head><body><div class="wrap">
 
 <h1>ESP32-Audio-Kit · MP3</h1>
-<div class="sub">아날로그 출력이 죽은 보드라 소리는 <b>블루투스(A2DP)</b>로 나간다.</div>
+<div class="sub">3.5mm 잭과 블루투스 양쪽으로 소리를 낸다. 맥·폰이 이 보드에 연결하는 <b>BT 스피커</b> 역할도 된다.</div>
 
 <div class="card">
   <div class="row spread" style="margin-bottom:8px">
@@ -72,6 +72,20 @@ progress{width:100%;height:5px}
 
 <div class="card">
   <div class="row spread" style="margin-bottom:8px">
+    <h2 style="margin:0">역할</h2>
+    <span id="rolest" class="pill">…</span>
+  </div>
+  <div class="row">
+    <button id="rp" onclick="role('player')">플레이어 (파일 재생)</button>
+    <button id="rs" onclick="role('sink')">BT 스피커 (맥·폰이 연결)</button>
+  </div>
+  <div class="note"><b>BT 스피커</b>로 두면 맥·폰에서 블루투스를 스캔해 <code>KETI-MP3</code>를
+  고르면 된다 — 그 소리가 이 보드의 3.5mm 잭으로 나온다. 전환하면 <b>재부팅</b>한다
+  (Bluedroid 는 소스와 싱크를 동시에 못 든다).</div>
+</div>
+
+<div class="card">
+  <div class="row spread" style="margin-bottom:8px">
     <h2 style="margin:0">출력 경로</h2>
     <span id="outst" class="pill">…</span>
   </div>
@@ -80,10 +94,9 @@ progress{width:100%;height:5px}
     <button id="oj" onclick="api('/api/out?m=jack')">3.5mm 잭</button>
     <button onclick="api('/api/tone?s=5')">잭 테스트음 5초</button>
   </div>
-  <div class="note">잭이 살아 있는지는 <b>아직 아무도 확인한 적이 없다</b>. 기존 판정은 마이크로
-  듣는 방식이었고 그 방법은 입력이 죽으면 출력이 살아 있어도 실패한다. 확정된 건 입력(ADC)이
-  정확히 0 이라는 것뿐. <b>이어폰을 꽂고 테스트음을 눌러라</b> — 들리면 잭 출력이 살아 있다.
-  안 들리면 가운데 DIP 스위치를 하나씩 토글하면서 다시 눌러 봐라.</div>
+  <div class="note"><b>잭 출력은 실기로 확인됐다</b>(2026-09-08). 8월에 "오디오가 죽었다" 고
+  적힌 것은 <code>board_pins.h</code> 의 LRCK/DOUT 이 25/26 으로 뒤바뀌어 있었던 탓이다.
+  이어폰은 <b>EARPHONE</b> 잭에 꽂아야 한다 — 옆의 <b>LINEIN</b> 은 입력이다.</div>
 </div>
 
 <div class="card">
@@ -121,14 +134,14 @@ progress{width:100%;height:5px}
   </div>
   <ul id="sdlist"></ul>
   <div class="note">이 펌웨어는 SD 에 <b>쓰지 않는다</b> — 업로드·삭제는 내장 플래시에만 적용된다.
-  카드를 통째로 내려받으려면 PC 에서 <code>tools/sd_backup.sh</code> 를 돌려라.</div>
+  카드를 통째로 내려받으려면 PC 에서 <code>tools/sd_backup.py</code> 를 돌려라.</div>
 </div>
 
 <div class="card">
   <h2>버튼 6개</h2>
   <div class="keys">
     <div><b>KEY1</b> 재생/정지</div><div><b>KEY2</b> 다음곡</div><div><b>KEY3</b> 이전곡</div>
-    <div><b>KEY4</b> 음량+<br>(길게=테스트음)</div><div><b>KEY5</b> 음량−<br>(길게=출력전환)</div><div><b>KEY6</b> BT 재연결<br>(길게=탐색)</div>
+    <div><b>KEY4</b> 음량+<br>(길게=테스트음)</div><div><b>KEY5</b> 음량−<br>(길게=출력전환)</div><div><b>KEY6</b> BT 재연결<br>(헤드폰검출 겸용)</div>
   </div>
 </div>
 
@@ -163,6 +176,11 @@ async function tick(){
   $('ela').textContent = mmss(s.elapsed); $('tot').textContent = s.duration?mmss(s.duration):'—:—';
   if(!dragVol){ $('vol').value=s.vol; $('vlab').textContent=s.vol; }
 
+  const sink = s.role=='sink';
+  $('rolest').textContent = sink ? ('BT 스피커 · '+s.sinkhz+'Hz · '+s.sinkkb+' KB 수신'+(s.sinkdrop?' · 버림 '+s.sinkdrop:'')) : '플레이어';
+  $('rolest').className='pill '+(sink?'warn':'ok');
+  $('rp').className = sink?'':'p'; $('rs').className = sink?'p':'';
+
   const jack = s.out=='jack';
   $('outst').textContent = (jack?'잭':'블루투스') + (s.tone?' · 테스트음 재생중':'') + (s.jackok?'':' · AC101 없음');
   $('outst').className='pill '+(s.tone?'warn':'ok');
@@ -195,6 +213,8 @@ async function sd(p){
     ).join('') : '<li><span class="nm" style="color:var(--dim)">비어 있음</span></li>');
 }
 const esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+async function role(r){ if(!confirm(r=='sink'?'BT 스피커로 바꾸고 재부팅한다':'플레이어로 바꾸고 재부팅한다'))return;
+  await fetch('/api/role?r='+r,{method:'POST'}); $('upmsg').textContent='역할 전환, 재부팅 중…'; }
 async function del(n){ if(!confirm(decodeURIComponent(n)+' 삭제?'))return; await fetch('/api/delete?f='+n,{method:'POST'}); tick(); }
 async function wifi(){ await fetch('/api/wifi?ssid='+encodeURIComponent($('ssid').value)+'&pass='+encodeURIComponent($('pass').value),{method:'POST'});
   $('upmsg').textContent='저장했다. 재부팅 중…'; }
