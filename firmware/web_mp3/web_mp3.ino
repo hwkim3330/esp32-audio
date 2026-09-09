@@ -1799,6 +1799,25 @@ static void api_sd_get()
 static File g_up;
 static String g_up_err;
 
+// 업로드 쓰기 버퍼.
+//
+// WebServer 는 멀티파트를 2KB(HTTP_UPLOAD_BUFLEN) 단위로 넘겨준다. 그걸 그대로 SD 에
+// 쓰면 블록마다 FAT 오버헤드가 붙어 실측 **72.8KB/s** 밖에 안 나왔다(같은 링크에서
+// 다운로드는 630KB/s 다). 32KB 로 모아 한 번에 쓰면 그 오버헤드가 줄어든다.
+// 버퍼는 PSRAM 에 둔다 — 내부 DRAM 은 이 보드의 진짜 천장이다.
+static const size_t UP_BUF_SZ = 32 * 1024;
+static uint8_t *g_up_buf = nullptr;
+static size_t   g_up_fill = 0;
+
+static bool up_flush()
+{
+    if (!g_up || g_up_fill == 0) return true;
+    const size_t w = g_up.write(g_up_buf, g_up_fill);
+    const bool ok = (w == g_up_fill);
+    g_up_fill = 0;
+    return ok;
+}
+
 static bool sd_music_path(const String &name, String &out)
 {
     String n = name.substring(name.lastIndexOf('/') + 1);   // 디렉터리 성분 제거
@@ -1812,6 +1831,7 @@ static void api_upload()
     HTTPUpload &u = g_http.upload();
     if (u.status == UPLOAD_FILE_START) {
         g_up_err = "";
+        g_up_fill = 0;
         g_busy_fs = true;
         cmd_stop();                            // 업로드 중에는 재생을 접는다(글리치 방지)
         String n = u.filename;
@@ -1837,13 +1857,23 @@ static void api_upload()
         }
     } else if (u.status == UPLOAD_FILE_WRITE) {
         if (g_up && g_up_err.isEmpty()) {
-            if (g_up.write(u.buf, u.currentSize) != u.currentSize) {
-                g_up_err = "저장소가 꽉 찼다";
-                g_up.close();
+            size_t off = 0;
+            while (off < u.currentSize) {
+                const size_t room = UP_BUF_SZ - g_up_fill;
+                const size_t n = min(room, (size_t)(u.currentSize - off));
+                if (g_up_buf) {
+                    memcpy(g_up_buf + g_up_fill, u.buf + off, n);
+                    g_up_fill += n;
+                } else {                       // 버퍼가 없으면 예전처럼 바로 쓴다
+                    if (g_up.write(u.buf + off, n) != n) { g_up_err = "저장소가 꽉 찼다"; break; }
+                }
+                off += n;
+                if (g_up_fill == UP_BUF_SZ && !up_flush()) { g_up_err = "저장소가 꽉 찼다"; break; }
             }
+            if (!g_up_err.isEmpty()) g_up.close();
         }
     } else if (u.status == UPLOAD_FILE_END || u.status == UPLOAD_FILE_ABORTED) {
-        if (g_up) g_up.close();
+        if (g_up) { if (!up_flush()) g_up_err = "저장소가 꽉 찼다"; g_up.close(); }
         g_busy_fs = false;
         if (u.status == UPLOAD_FILE_ABORTED) g_up_err = "중단됨";
         lib_rescan();
@@ -2102,6 +2132,24 @@ static void keys_poll()
         const bool lvl = digitalRead(k.pin);            // 눌리면 LOW
         if (k.prev && !lvl) { k.down_at = now; k.longsent = false; }
         else if (!k.prev && lvl && now - k.down_at > 30 && !k.longsent) {
+            // 보청기/잡음억제 모드에서는 버튼이 **그 모드의 파라미터**를 움직인다.
+            // 화면이 없으니 손으로 조절할 수 있어야 실제로 쓸 수 있다.
+            if (g_pmode != PM_NORMAL) {
+                switch (k.pin) {
+                case KEY_PLAY: g_mode_req = PM_NORMAL;                       // 일반으로 복귀
+                               g_prefs.putInt("pmode", (int)PM_NORMAL); break;
+                case KEY_NEXT: g_nr_strength = min(100, g_nr_strength + 10); aid_reset(); break;
+                case KEY_PREV: g_nr_strength = max(0, g_nr_strength - 10);   aid_reset(); break;
+                case KEY_VUP:  g_out_gain = min(400, g_out_gain + 20);       break;
+                case KEY_VDN:  g_out_gain = max(50, g_out_gain - 20);        break;
+                case KEY_BT:   g_beam = g_beam ? 0 : 1; aid_reset();         break;
+                }
+                Serial.printf("[key] GPIO%d — NR %d%% · 게인 %d%% · beam %s\n",
+                              k.pin, g_nr_strength, g_out_gain, g_beam ? "차동" : "합");
+                k.prev = lvl;
+                continue;
+            }
+
             // 싱크 모드에서는 같은 버튼이 **맥의 재생**을 움직인다(AVRCP).
             if (g_role == ROLE_SINK) {
                 switch (k.pin) {
@@ -2178,7 +2226,9 @@ void setup()
     g_mic_vol = (uint16_t)g_prefs.getInt("micvol", 0xa0a0);
     g_speech_gain_db = g_prefs.getInt("speech", 8);
     g_nr_strength = g_prefs.getInt("nrs", 70);
-    g_out_gain = g_prefs.getInt("ogain", 100);
+    // 보청기 기본 게인. 100% 는 실측에서 너무 작았다(출력 RMS 444) — 보청기로 쓰려면
+    // 증폭이 있어야 의미가 있다. WDRC 컴프레서가 큰 소리를 눌러 주므로 200% 가 안전하다.
+    g_out_gain = g_prefs.getInt("ogain", 200);
     // 싱크는 기본 볼륨을 높게 둔다. 디지털은 풀스케일로 흘리고 크기는 아날로그와
     // 맥의 AVRCP 볼륨으로 조절하는 것이 잡음이 가장 적다.
     if (g_role == ROLE_SINK) g_vol = g_prefs.getInt("vol", 85);
@@ -2193,6 +2243,7 @@ void setup()
     // minimp3 의 프레임 스크래치도 PSRAM 으로 뺀다. 원본은 이걸 스택에 잡는데 16KB 가
     // 넘어서 6KB 스택 태스크가 "Stack canary watchpoint triggered (dec)" 로 즉사했다.
     // 내부 DRAM 이 27KB 뿐이라 스택을 키우는 건 답이 아니었다.
+    g_up_buf = (uint8_t *)ps_malloc(UP_BUF_SZ);      // 업로드 모아쓰기 버퍼
     void *scratch = ps_malloc(mp3dec_scratch_size());
     mp3dec_set_scratch(scratch);
     Serial.printf("[mem] minimp3 스크래치 %u KB 를 PSRAM 에 잡았다\n",
@@ -2222,6 +2273,10 @@ void setup()
 
     Serial.printf("[출력] %s\n", g_out == OUT_JACK ? "잭 (AC101/I2S)" : "블루투스 (A2DP)");
 
+    // 저장된 처리 모드를 복원한다. aid_task 가 뜬 뒤 요청으로 넘겨야 I2S 재설치가
+    // 한 곳에서만 일어난다(지금까지 /api/mode 로 저장만 하고 부팅 때 안 읽었다).
+    const int saved_pmode = g_prefs.getInt("pmode", (int)PM_NORMAL);
+
     // 디코더와 잭 송출은 코어 1 에. WiFi/BT 스택은 코어 0 에서 돈다.
     xTaskCreatePinnedToCore(decode_task, "dec", 6144, nullptr, 5, nullptr, 1);
     if (g_codec_ok) xTaskCreatePinnedToCore(jack_task, "jack", 4096, nullptr, 6, nullptr, 1);
@@ -2231,6 +2286,11 @@ void setup()
     if (g_codec_ok && g_role == ROLE_PLAYER) {
         aid_reset();
         xTaskCreatePinnedToCore(aid_task, "aid", 6144, nullptr, 7, nullptr, 1);
+        if (saved_pmode != (int)PM_NORMAL) {
+            g_mode_req = saved_pmode;
+            Serial.printf("[모드] 저장된 모드 복원 요청: %s\n",
+                          saved_pmode == (int)PM_HEARING ? "보청기" : "잡음억제");
+        }
     }
 
     // 초기화가 끝난 뒤의 내부 힙이 진짜 여유다. 여기가 20KB 밑으로 떨어지면
