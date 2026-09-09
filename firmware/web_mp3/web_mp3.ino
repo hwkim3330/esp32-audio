@@ -2278,7 +2278,12 @@ void setup()
     const int saved_pmode = g_prefs.getInt("pmode", (int)PM_NORMAL);
 
     // 디코더와 잭 송출은 코어 1 에. WiFi/BT 스택은 코어 0 에서 돈다.
-    xTaskCreatePinnedToCore(decode_task, "dec", 6144, nullptr, 5, nullptr, 1);
+    //
+    // 싱크(BT 스피커) 모드에서는 파일을 디코드하지 않으므로 이 태스크를 만들지
+    // 않는다 — 스택 6KB 가 그대로 내부 DRAM 이다. 싱크는 초기화 후 힙이 15KB 까지
+    // 떨어지는 구성이고, 이 보드에서 그 수준은 위험하다(전에 11KB 에서 죽었다).
+    if (g_role == ROLE_PLAYER)
+        xTaskCreatePinnedToCore(decode_task, "dec", 6144, nullptr, 5, nullptr, 1);
     if (g_codec_ok) xTaskCreatePinnedToCore(jack_task, "jack", 4096, nullptr, 6, nullptr, 1);
     if (g_codec_ok && g_role == ROLE_PLAYER)
         xTaskCreatePinnedToCore(rec_task, "rec", 4096, nullptr, 4, nullptr, 1);
