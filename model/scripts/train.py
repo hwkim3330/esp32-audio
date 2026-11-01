@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import cabin_aug as CA
 import features as FE
 
 try:
@@ -52,9 +53,12 @@ class Augment:
     잔향·노이즈·이득·시간이동을 웨이브폼에서, 마스킹을 스펙트럼에서 건다.
     """
 
-    def __init__(self, rng: np.random.Generator, enable: bool = True):
+    def __init__(self, rng: np.random.Generator, enable: bool = True,
+                 mode: str = "legacy", cabin_p: float = 0.7):
         self.rng = rng
+        self.cabin_p = cabin_p
         self.enable = enable
+        self.mode = mode
 
     def _reverb(self, x: np.ndarray) -> np.ndarray:
         rt60 = self.rng.uniform(0.08, 0.35)
@@ -93,6 +97,11 @@ class Augment:
             x = np.concatenate([np.zeros(shift, np.float32), x])
         elif shift < 0:
             x = x[-shift:] if -shift < len(x) else x[:1]
+        if self.mode == "cabin" and self.rng.random() < self.cabin_p:
+            # 캐빈 음향 시뮬레이션(cabin_aug.py): 구조 있는 잡음 + 캐빈 RIR + 마이크
+            # 경로(대역 제한·AGC·클리핑). 나머지(기본 30%)는 예전 증강을 그대로 둔다 —
+            # 깨끗한 입력과 단순 잡음에서의 성능을 잃지 않으려고.
+            return CA.cabin(x, self.rng)
         if self.rng.random() < 0.6:
             x = self._reverb(x)
         if self.rng.random() < 0.9:
@@ -117,8 +126,11 @@ class Augment:
 
 class Utterances(torch.utils.data.Dataset):
     def __init__(self, items: list[dict], root: Path, text2id: dict[str, int],
-                 train: bool, seed: int = 0):
+                 train: bool, seed: int = 0, aug: str = "legacy",
+                 cabin_p: float = 0.7):
         self.items = items
+        self.aug = aug
+        self.cabin_p = cabin_p
         self.root = root
         self.text2id = text2id
         self.train = train
@@ -131,7 +143,7 @@ class Utterances(torch.utils.data.Dataset):
     def __getitem__(self, i: int):
         # 워커별·에폭별로 다른 증강이 나오되 재현 가능하게.
         rng = np.random.default_rng((self.seed, i, torch.initial_seed() % (1 << 31)))
-        aug = Augment(rng, enable=self.train)
+        aug = Augment(rng, enable=self.train, mode=self.aug, cabin_p=self.cabin_p)
         x = aug.wave(self.pcm[i])
         m = FE.normalize(FE.logmel(x))
         m = aug.spec(m)
@@ -270,6 +282,11 @@ def main() -> int:
                     help="OOD 를 학습 라벨에 넣는 방식. exclude 는 예전 동작(오수락 52.8%)")
     ap.add_argument("--ood-holdout", type=float, default=0.3,
                     help="새 OOD 문장 중 평가 전용으로 뺄 비율")
+    ap.add_argument("--aug", choices=["legacy", "cabin"], default="legacy",
+                    help="학습 증강. cabin 은 cabin_aug.py 의 캐빈 음향 시뮬레이션을 70%% 확률로 쓴다")
+    ap.add_argument("--cabin-p", type=float, default=0.7,
+                    help="--aug cabin 일 때 캐빈 시뮬레이션을 쓰는 확률")
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--tag", default="",
                     help="산출물 접미사. 조건별 비교 실행 시 서로 덮어쓰지 않게 한다")
     args = ap.parse_args()
@@ -282,7 +299,10 @@ def main() -> int:
     items = man["items"]
     outd = Path(args.out); outd.mkdir(parents=True, exist_ok=True)
 
-    cmd_items = [it for it in items if it["label"] != "_ood"]
+    # "_" 로 시작하는 라벨(_ood, _wake, _alt)은 명령 클래스가 아니다. 예전에는
+    # label != "_ood" 로 걸러서, 호출어 클립(_wake)을 합성한 뒤 재학습하면 호출어가
+    # 명령 문장으로 학습에 들어갔다 — "호출어는 학습에 없다" 는 측정이 깨진다.
+    cmd_items = [it for it in items if not it["label"].startswith("_")]
     ood_items = [it for it in items if it["label"] == "_ood"]
     texts = sorted({it["text"] for it in cmd_items})
 
@@ -373,7 +393,8 @@ def main() -> int:
           f"OOD {len(test_ood_base)}(baseline)+{len(test_ood_new)}(새 문장)")
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    ds_tr = Utterances(train_items, root, text2id, train=True, seed=args.seed)
+    ds_tr = Utterances(train_items, root, text2id, train=True, seed=args.seed,
+                       aug=args.aug, cabin_p=args.cabin_p)
     mk = lambda its: Utterances(its, root, text2id, train=False)
     ds_en_s, ds_te_s = mk(enroll_seen), mk(test_seen)
     ds_en_u, ds_te_u = mk(enroll_unseen), mk(test_unseen)
@@ -383,7 +404,7 @@ def main() -> int:
     ds_ood_en = mk(ood_train_items) if ood_train_items else None
 
     dl = torch.utils.data.DataLoader(
-        ds_tr, batch_size=args.bs, shuffle=True, num_workers=8,
+        ds_tr, batch_size=args.bs, shuffle=True, num_workers=args.workers,
         drop_last=True, persistent_workers=True)
 
     model = Encoder(dim=args.dim, w=args.width).to(dev)
@@ -439,7 +460,9 @@ def main() -> int:
                             "dim": args.dim, "width": args.width,
                             "texts": texts, "n_frames": FE.N_FRAMES,
                             "n_mels": FE.N_MELS,
-                            "ood_mode": args.ood_mode,
+                            "ood_mode": args.ood_mode, "aug": args.aug,
+                            "cabin_p": args.cabin_p if args.aug == "cabin" else 0.0,
+                            "seed": args.seed,
                             "ood_train_texts": ood_train_texts},
                            ckpt_path)
                 line += "  *저장"

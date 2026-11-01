@@ -128,8 +128,11 @@ def main() -> int:
         if weak:
             print(f"약한 문구 {len(weak)}개 제외 (enroll.py 와 동일)")
 
+    # 명령은 "_" 로 시작하지 않는 라벨뿐이다. 예전에는 label != "_ood" 로 걸러서
+    # 호출어 클립(_wake, 후보 4개 × 보이스 × 속도)이 명령으로 등록·채점됐다 — 같은
+    # 체크포인트로 enroll.py 는 8.1%, 이 스크립트는 11.7% 를 냈다(두 번째 갈라짐).
     def is_cmd(it):
-        return it["label"] != "_ood" and it["text"] not in weak
+        return not it["label"].startswith("_") and it["text"] not in weak
 
     cmd_enroll = [it for it in items if is_cmd(it) and it["voice"] in en_v]
     cmd_test = [it for it in items if is_cmd(it) and it["voice"] in te_v]

@@ -432,14 +432,17 @@
     "호출어. 상시 인식을 없애는 실전 완화책이고, 동시에 이 설계의 핵심 주장을 시험한다 -",
     "호출어는 학습 데이터에 없으므로 '재학습 없이 등록만으로 새 문구가 되는가' 의 답이다.",
     "",
-    "wake_candidates 4개를 보류 보이스(F5/M5)로 재서 골랐다. negative 는 두 종류를 다 센다 -",
-    "명령 문구가 호출어로 잡히면 게이트가 무의미해지고, 명령 아닌 말이 잡히면 게이트가",
-    "오히려 오작동을 만든다. 호출어 재현율 95% 지점:",
+    "wake_candidates 4개를 보류 보이스(F5/M5) 18클립(속도 9개)으로 재서 골랐다. negative 는 두 종류를",
+    "다 센다 - 명령 문구가 호출어로 잡히면 게이트가 무의미해지고, 명령 아닌 말이 잡히면 게이트가",
+    "오히려 오작동을 만든다. 호출어 재현율 95% 지점 (2026-11 배포본):",
     "",
-    "  하이 캐빈    AUROC 1.000/0.999   오각성 명령 0.2% / OOD 0.0%   <- 채택",
-    "  헤이 캐빈    AUROC 0.997/0.995   오각성 명령 0.6% / OOD 1.8%",
-    "  캐빈아      AUROC 0.997/0.998   오각성 명령 1.0% / OOD 0.9%",
-    "  캐빈 들어봐  AUROC 0.989/0.999   오각성 명령 1.9% / OOD 0.5%",
+    "  하이 캐빈    AUROC 0.999/0.998   오각성 명령 0.0% / OOD 0.5%   <- 채택",
+    "  헤이 캐빈    AUROC 1.000/0.998   오각성 명령 0.2% / OOD 0.9%",
+    "  캐빈아      AUROC 0.994/0.996   오각성 명령 1.9% / OOD 2.7%",
+    "  캐빈 들어봐  AUROC 0.930/0.961   오각성 명령 38.7% / OOD 26.6%",
+    "",
+    "예전 표(0.2%/0.0%)는 양성 6클립 위의 값이라 '재현율 95%' 가 실제로는 5/6=83% 였다.",
+    "잡음에서는 호출어 오거부가 병목이다(캐빈 잡음 52%) - model/README.md 의 호출어 절.",
     "",
     "고르는 기준은 두 오각성률의 최댓값이다 - 어느 쪽이든 새면 게이트가 무의미해지므로",
     "평균이 아니라 최댓값으로 본다. 'ㅎ+ㅏㅣ' 가 명령·OOD 어휘와 전혀 겹치지 않는 것이 이유로",
@@ -449,5 +452,114 @@
     "창을 계속 밀며 돌아가므로 노출 횟수가 훨씬 많다. 222클립에 0% 라는 것이 '시간당 오각성",
     "0회' 를 뜻하지 않는다 - 그건 보드에서 재야 한다."
   ],
-  "wake_phrase": "하이 캐빈"
+  "wake_phrase": "하이 캐빈",
+  "alt_phrases": [
+    {
+      "text": "캐빈 넘겨",
+      "intent": "music_next",
+      "replaces": "넘겨",
+      "syllables": 2
+    },
+    {
+      "text": "캐빈 이전 곡",
+      "intent": "music_prev",
+      "replaces": "이전 곡",
+      "syllables": 3
+    },
+    {
+      "text": "캐빈 전 곡",
+      "intent": "music_prev",
+      "replaces": "전 곡",
+      "syllables": 2
+    },
+    {
+      "text": "캐빈 볼륨 업",
+      "intent": "vol_up",
+      "replaces": "볼륨 업",
+      "syllables": 3
+    },
+    {
+      "text": "캐빈 문 잠가",
+      "intent": "door_lock",
+      "replaces": "문 잠가",
+      "syllables": 3
+    },
+    {
+      "text": "캐빈 잠금",
+      "intent": "door_lock",
+      "replaces": "잠금",
+      "syllables": 2
+    },
+    {
+      "text": "캐빈 집 가자",
+      "intent": "nav_home",
+      "replaces": "집 가자",
+      "syllables": 3
+    },
+    {
+      "text": "캐빈 안녕",
+      "intent": "greet",
+      "replaces": "안녕",
+      "syllables": 2
+    },
+    {
+      "text": "캐빈 야",
+      "intent": "greet",
+      "replaces": "야",
+      "syllables": 1
+    },
+    {
+      "text": "캐빈 고마워",
+      "intent": "thanks",
+      "replaces": "고마워",
+      "syllables": 3
+    },
+    {
+      "text": "캐빈 잘했어",
+      "intent": "thanks",
+      "replaces": "잘했어",
+      "syllables": 3
+    },
+    {
+      "text": "캐빈 고맙다",
+      "intent": "thanks",
+      "replaces": "고맙다",
+      "syllables": 3
+    },
+    {
+      "text": "캐빈 심심해",
+      "intent": "joke",
+      "replaces": "심심해",
+      "syllables": 3
+    },
+    {
+      "text": "캐빈 아니야",
+      "intent": "cancel",
+      "replaces": "아니야",
+      "syllables": 3
+    },
+    {
+      "text": "캐빈 취소",
+      "intent": "cancel",
+      "replaces": "취소",
+      "syllables": 2
+    },
+    {
+      "text": "캐빈 됐어",
+      "intent": "cancel",
+      "replaces": "됐어",
+      "syllables": 2
+    },
+    {
+      "text": "캐빈 그만",
+      "intent": "cancel",
+      "replaces": "그만",
+      "syllables": 2
+    }
+  ],
+  "_alt_phrases_comment": [
+    "제품 옵션 시험용: 남은 짧은 명령(3음절 이하)에 '캐빈' 을 붙인 문구. 학습에는 들어가지 않고",
+    "(gen_data.py --alt-only, label=_alt) eval_system.py --prefix 가 등록만으로 갈아 끼워 잰다.",
+    "채택 여부와 그 대가는 model/README.md 의 '짧은 명령에 접두어' 절."
+  ]
 }
