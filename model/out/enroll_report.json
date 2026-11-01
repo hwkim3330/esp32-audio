@@ -1,16 +1,16 @@
 {
- "intent_accuracy": 0.9476744186046512,
- "phrase_accuracy": 0.9186046511627907,
+ "intent_accuracy": 0.9573643410852714,
+ "phrase_accuracy": 0.936046511627907,
  "n_test": 516,
- "reject_margin": 0.6137762069702148,
- "ood_false_accept": 0.08108108108108109,
+ "reject_margin": 0.6853244304656982,
+ "ood_false_accept": 0.09009009009009009,
  "n_ood_eval": 222,
  "n_ood_protos": 0,
  "ood_false_accept_by_group": {
-  "baseline30": 0.027777777777777776,
-  "hard_negative": 0.016129032258064516,
-  "chitchat": 0.05714285714285714,
-  "short": 0.2222222222222222
+  "baseline30": 0.0,
+  "hard_negative": 0.03225806451612903,
+  "chitchat": 0.02857142857142857,
+  "short": 0.2962962962962963
  },
  "ood_mode": "perphrase",
  "enroll_voices": [
@@ -29,89 +29,64 @@
  ],
  "confusion_top": [
   {
-   "n": 3,
+   "n": 2,
+   "true": "window_open",
+   "pred": "window_close"
+  },
+  {
+   "n": 2,
    "true": "cancel",
    "pred": "greet"
   },
   {
-   "n": 3,
-   "true": "ac_on",
-   "pred": "ac_off"
+   "n": 2,
+   "true": "ac_off",
+   "pred": "ac_on"
   },
   {
-   "n": 2,
+   "n": 1,
+   "true": "window_open",
+   "pred": "ac_on"
+  },
+  {
+   "n": 1,
+   "true": "window_close",
+   "pred": "ac_on"
+  },
+  {
+   "n": 1,
+   "true": "vol_up",
+   "pred": "vol_down"
+  },
+  {
+   "n": 1,
+   "true": "vol_down",
+   "pred": "music_prev"
+  },
+  {
+   "n": 1,
+   "true": "thanks",
+   "pred": "music_stop"
+  },
+  {
+   "n": 1,
+   "true": "nav_home",
+   "pred": "joke"
+  },
+  {
+   "n": 1,
    "true": "music_play",
    "pred": "music_stop"
   },
   {
    "n": 1,
-   "true": "window_open",
-   "pred": "joke"
-  },
-  {
-   "n": 1,
-   "true": "window_open",
-   "pred": "fan_up"
-  },
-  {
-   "n": 1,
-   "true": "window_close",
-   "pred": "window_open"
-  },
-  {
-   "n": 1,
-   "true": "vol_down",
-   "pred": "vol_up"
-  },
-  {
-   "n": 1,
-   "true": "vol_down",
-   "pred": "nav_home"
-  },
-  {
-   "n": 1,
-   "true": "vol_down",
-   "pred": "joke"
-  },
-  {
-   "n": 1,
-   "true": "temp_up",
-   "pred": "music_prev"
-  },
-  {
-   "n": 1,
-   "true": "temp_down",
-   "pred": "joke"
-  },
-  {
-   "n": 1,
-   "true": "nav_reroute",
-   "pred": "music_next"
-  },
-  {
-   "n": 1,
-   "true": "nav_charger",
-   "pred": "fan_up"
-  },
-  {
-   "n": 1,
    "true": "music_play",
-   "pred": "nav_reroute"
-  },
-  {
-   "n": 1,
-   "true": "music_play",
-   "pred": "door_lock"
-  },
-  {
-   "n": 1,
-   "true": "music_next",
-   "pred": "greet"
+   "pred": "ac_on"
   },
   {
    "n": 1,
    "true": "joke",
-   "pred": "autopilot_on"
+   "pred": "music_play"
   },
   {
    "n": 1,
@@ -121,41 +96,61 @@
   {
    "n": 1,
    "true": "greet",
-   "pred": "music_next"
+   "pred": "nav_reroute"
   },
   {
    "n": 1,
-   "true": "ask_tire",
-   "pred": "joke"
+   "true": "greet",
+   "pred": "music_stop"
+  },
+  {
+   "n": 1,
+   "true": "greet",
+   "pred": "music_prev"
+  },
+  {
+   "n": 1,
+   "true": "door_lock",
+   "pred": "window_open"
+  },
+  {
+   "n": 1,
+   "true": "door_lock",
+   "pred": "window_close"
+  },
+  {
+   "n": 1,
+   "true": "ac_on",
+   "pred": "ac_off"
   }
  ],
  "per_intent_recall": {
-  "ac_on": 0.875,
+  "ac_on": 0.9583333333333334,
   "ac_off": 0.8888888888888888,
-  "temp_up": 0.9583333333333334,
-  "temp_down": 0.9166666666666666,
+  "temp_up": 1.0,
+  "temp_down": 1.0,
   "fan_up": 1.0,
-  "music_play": 0.8333333333333334,
+  "music_play": 0.9166666666666666,
   "music_stop": 1.0,
-  "music_next": 0.9444444444444444,
+  "music_next": 1.0,
   "music_prev": 1.0,
-  "vol_up": 1.0,
-  "vol_down": 0.8333333333333334,
-  "window_open": 0.8888888888888888,
+  "vol_up": 0.9444444444444444,
+  "vol_down": 0.9444444444444444,
+  "window_open": 0.8333333333333334,
   "window_close": 0.9444444444444444,
-  "door_lock": 1.0,
-  "nav_home": 1.0,
+  "door_lock": 0.8888888888888888,
+  "nav_home": 0.9444444444444444,
   "nav_work": 1.0,
-  "nav_reroute": 0.9444444444444444,
-  "nav_charger": 0.9444444444444444,
+  "nav_reroute": 1.0,
+  "nav_charger": 1.0,
   "ask_battery": 1.0,
   "ask_range": 1.0,
-  "ask_tire": 0.9444444444444444,
+  "ask_tire": 1.0,
   "autopilot_on": 1.0,
   "autopilot_off": 1.0,
-  "greet": 0.9166666666666666,
-  "thanks": 1.0,
+  "greet": 0.8333333333333334,
+  "thanks": 0.9444444444444444,
   "joke": 0.9444444444444444,
-  "cancel": 0.875
+  "cancel": 0.9166666666666666
  }
 }

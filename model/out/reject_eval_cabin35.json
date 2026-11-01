@@ -1,0 +1,36 @@
+{
+ "encoder": {
+  "mode": "perphrase",
+  "n_cmd_proto": 86,
+  "rules": {
+   "thr_only": {
+    "threshold": 0.6853244304656982,
+    "far": 0.09009009009009009,
+    "cmd_recall": 0.9496124031007752,
+    "auroc": 0.9783853621062923,
+    "bank_rows": 0,
+    "bank_flash_kb": 0.0,
+    "far_by_group": {
+     "baseline30": 0.0,
+     "chitchat": 0.02857142857142857,
+     "hard_negative": 0.03225806451612903,
+     "short": 0.2962962962962963
+    }
+   },
+   "margin_bank218": {
+    "threshold": 0.017155662178993225,
+    "far": 0.11261261261261261,
+    "cmd_recall": 0.9496124031007752,
+    "auroc": 0.98411201899574,
+    "bank_rows": 218,
+    "bank_flash_kb": 109.0,
+    "far_by_group": {
+     "baseline30": 0.027777777777777776,
+     "chitchat": 0.014285714285714285,
+     "hard_negative": 0.06451612903225806,
+     "short": 0.35185185185185186
+    }
+   }
+  }
+ }
+}
